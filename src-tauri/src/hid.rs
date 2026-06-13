@@ -603,6 +603,29 @@ pub async fn hid_write_band(state: State<'_, HidState>, band: EqBand) -> CmdResu
     Ok(())
 }
 
+/// Send a raw HID output report (report id + payload bytes) to the connected device.
+///
+/// Used by the T02-family (0x3302) EQ protocol, where the frontend computes the exact
+/// biquad-coefficient frames (validated byte-for-byte against the official web app) and
+/// streams them here verbatim. See `src/features/eq/t02-protocol.ts`.
+#[tauri::command]
+pub async fn hid_send_raw(
+    state: State<'_, HidState>,
+    report_id: u8,
+    data: Vec<u8>,
+) -> CmdResult<()> {
+    let mut mgr = lock(&state)?;
+    if !mgr.is_connected() {
+        return Err(HidError::NotConnected);
+    }
+    {
+        let dev = mgr.hid.as_ref().expect("connected");
+        write_report(dev, report_id, &data)?;
+    }
+    mgr.last_io = Some(Instant::now());
+    Ok(())
+}
+
 /// Patch the cached EQ snapshot with a single edited band.
 fn update_cached_band(mgr: &mut HidManager, band: &EqBand) {
     let eq = mgr.cached_eq.get_or_insert_with(EqState::default);

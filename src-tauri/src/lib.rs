@@ -211,6 +211,7 @@ pub fn run() {
             hid::hid_disconnect,
             hid::hid_read_eq,
             hid::hid_write_band,
+            hid::hid_send_raw,
             hid::hid_write_preamp,
             hid::hid_factory_reset,
             hid::hid_list_devices,

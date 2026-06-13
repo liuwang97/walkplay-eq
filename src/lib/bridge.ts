@@ -83,6 +83,11 @@ export function hidWritePreamp(preamp: number): Promise<void> {
   return invoke<void>("hid_write_preamp", { preamp });
 }
 
+/** Send a raw HID output report (report id + payload). Used by the T02 coeff protocol. */
+export function hidSendRaw(reportId: number, data: number[]): Promise<void> {
+  return invoke<void>("hid_send_raw", { reportId, data });
+}
+
 /** Reset the device EQ to factory defaults. */
 export function hidFactoryReset(): Promise<void> {
   return invoke<void>("hid_factory_reset");

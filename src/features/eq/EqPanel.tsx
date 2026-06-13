@@ -46,6 +46,8 @@ export function EqPanel() {
   const setPreamp = useEqStore((s) => s.setPreamp);
   const applyPreset = useEqStore((s) => s.applyPreset);
   const factoryReset = useEqStore((s) => s.factoryReset);
+  const saveAsCustom = useEqStore((s) => s.saveAsCustom);
+  const updateCustom = useEqStore((s) => s.updateCustom);
 
   const busy = status === "busy";
 
@@ -74,16 +76,26 @@ export function EqPanel() {
     }
   }, [factoryReset, t]);
 
-  // The cloud-backed actions (save / update / share) are owned by the
-  // API + presets agents. We surface the buttons and feedback hooks here;
-  // wiring lands when those modules expose their commands.
+  // 保存为自定义EQ — snapshot the live EQ into a new local custom preset
+  // (persisted to localStorage; appears under the 自定义 tab + tray Quick-EQ).
   const handleSaveCustom = React.useCallback(() => {
-    toast.info(t("eq.toast.savePending"));
-  }, [t]);
+    saveAsCustom();
+    toast.success(t("eq.toast.saveDone", { defaultValue: "已保存为自定义 EQ" }));
+  }, [saveAsCustom, t]);
 
+  // 更新自定义EQ — overwrite the currently-selected custom preset.
   const handleUpdateCustom = React.useCallback(() => {
-    toast.info(t("eq.toast.updatePending"));
-  }, [t]);
+    const ok = updateCustom();
+    if (ok) {
+      toast.success(t("eq.toast.updateDone", { defaultValue: "已更新自定义 EQ" }));
+    } else {
+      toast.warning(
+        t("eq.toast.updateNoTarget", {
+          defaultValue: "请先在「自定义」标签里选择一个要更新的 EQ",
+        }),
+      );
+    }
+  }, [updateCustom, t]);
 
   const handleShare = React.useCallback(() => {
     toast.info(t("eq.toast.sharePending"));

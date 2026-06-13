@@ -25,3 +25,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# hardware reverse-engineering probes (kept locally, not part of the app)
+probe*.cjs
+validate*.cjs
+sweepfs.cjs
+shelf-fix.cjs
+src-tauri/examples/probe.rs

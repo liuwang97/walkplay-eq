@@ -9,6 +9,7 @@
 import { create } from "zustand";
 import * as bridge from "./bridge";
 import { BUILTIN_PRESETS } from "@/features/presets/builtins";
+import { buildProgram, preampFrame, T02_REPORT_ID } from "@/features/eq/t02-protocol";
 import {
   DEFAULT_EQ_STATE,
   type ConnStatus,
@@ -17,6 +18,57 @@ import {
   type EqState,
   type Preset,
 } from "./types";
+
+/** localStorage key holding the user's locally-saved custom presets. */
+const CUSTOM_KEY = "walkplay.customPresets";
+
+function loadCustomPresets(): Preset[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? (arr as Preset[]).filter((p) => p && p.source === "custom") : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistCustomPresets(presets: Preset[]): void {
+  try {
+    localStorage.setItem(
+      CUSTOM_KEY,
+      JSON.stringify(presets.filter((p) => p.source === "custom")),
+    );
+  } catch {
+    /* storage unavailable — non-fatal */
+  }
+}
+
+/**
+ * Debounced full-program push. While dragging a slider we coalesce the rapid edits
+ * into one device write (~60ms after the last change). The T02 device wants the FULL
+ * 8-band program + commit on every change, so we always rebuild and stream it.
+ */
+let pushTimer: ReturnType<typeof setTimeout> | null = null;
+function schedulePush(get: () => EqStoreState): void {
+  if (!bridge.isTauri()) return;
+  if (pushTimer) clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => {
+    pushTimer = null;
+    const s = get();
+    if (s.status === "connected" || s.status === "busy") {
+      void s.pushToDevice().catch(() => {});
+    }
+  }, 60);
+}
+
+function newPresetId(): string {
+  try {
+    return "custom-" + crypto.randomUUID();
+  } catch {
+    return "custom-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+}
 
 export interface EqStoreState {
   device: DeviceInfo | null;
@@ -45,6 +97,13 @@ export interface EqStoreState {
   applyPreset: (preset: Preset) => void;
   /** Register the preset library and mirror it to the native tray. */
   setPresets: (presets: Preset[]) => void;
+  /** Snapshot the live EQ into a new local custom preset. Returns its id. */
+  saveAsCustom: (name?: string) => string;
+  /**
+   * Overwrite the currently-selected custom preset with the live EQ.
+   * Returns false when no custom preset is currently selected.
+   */
+  updateCustom: () => boolean;
 
   // --- Device-touching actions (delegate to bridge) ---
   /** Connect to a device (auto-picks primary when vid/pid omitted). */
@@ -65,7 +124,10 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
   eq: { bands: DEFAULT_EQ_STATE.bands.map((b) => ({ ...b })), preamp: DEFAULT_EQ_STATE.preamp },
   // Seed the library with the built-in presets so both the panel and the tray
   // have something to show before any cloud/custom presets load.
-  presets: BUILTIN_PRESETS.map((p) => ({ ...p, bands: p.bands.map((b) => ({ ...b })) })),
+  presets: [
+    ...BUILTIN_PRESETS.map((p) => ({ ...p, bands: p.bands.map((b) => ({ ...b })) })),
+    ...loadCustomPresets(),
+  ],
   currentPresetId: null,
   bridgeReady: false,
 
@@ -109,7 +171,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     };
   },
 
-  setBand: (id, patch) =>
+  setBand: (id, patch) => {
     set((s) => ({
       // A manual edit detaches the EQ from any selected preset.
       currentPresetId: null,
@@ -117,10 +179,14 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
         ...s.eq,
         bands: s.eq.bands.map((b) => (b.id === id ? { ...b, ...patch } : b)),
       },
-    })),
+    }));
+    schedulePush(get); // live-apply the edit to the device
+  },
 
-  setPreamp: (preamp) =>
-    set((s) => ({ currentPresetId: null, eq: { ...s.eq, preamp } })),
+  setPreamp: (preamp) => {
+    set((s) => ({ currentPresetId: null, eq: { ...s.eq, preamp } }));
+    schedulePush(get);
+  },
 
   applyPreset: (preset) => {
     set(() => ({
@@ -142,12 +208,47 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     }
   },
 
+  saveAsCustom: (name) => {
+    const { eq, presets } = get();
+    const id = newPresetId();
+    const customCount = presets.filter((p) => p.source === "custom").length;
+    const preset: Preset = {
+      id,
+      name: name && name.trim() ? name.trim() : `自定义 EQ ${customCount + 1}`,
+      bands: eq.bands.map((b) => ({ ...b })),
+      preamp: eq.preamp,
+      source: "custom",
+    };
+    const next = [...presets, preset];
+    set({ presets: next, currentPresetId: id });
+    persistCustomPresets(next);
+    if (bridge.isTauri()) {
+      void bridge.setTrayPresets(next.map((p) => ({ id: p.id, name: p.name }))).catch(() => {});
+    }
+    return id;
+  },
+
+  updateCustom: () => {
+    const { eq, presets, currentPresetId } = get();
+    const idx = presets.findIndex((p) => p.id === currentPresetId && p.source === "custom");
+    if (idx < 0) return false;
+    const next = presets.map((p, i) =>
+      i === idx ? { ...p, bands: eq.bands.map((b) => ({ ...b })), preamp: eq.preamp } : p,
+    );
+    set({ presets: next });
+    persistCustomPresets(next);
+    return true;
+  },
+
   connect: async (vid, pid) => {
     set({ status: "connecting" });
     try {
       const device = await bridge.hidConnect(vid, pid);
       set({ device, status: "connected" });
       await bridge.setTrayStatus("connected");
+      // Readback is blocked on Windows for this device, so push our current EQ to
+      // establish a known state (UI == device).
+      await get().pushToDevice().catch(() => {});
     } catch (err) {
       set({ status: "disconnected", device: null });
       throw err;
@@ -172,13 +273,18 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
   },
 
   pushToDevice: async () => {
+    if (!bridge.isTauri()) return;
     const { eq } = get();
     set({ status: "busy" });
     try {
-      for (const band of eq.bands) {
-        await bridge.hidWriteBand(band);
+      // T02-family protocol: stream the full 8-band biquad program + commit.
+      // (See src/features/eq/t02-protocol.ts — validated against the official app.)
+      const frames = buildProgram(eq.bands);
+      for (const frame of frames) {
+        await bridge.hidSendRaw(T02_REPORT_ID, frame);
       }
-      await bridge.hidWritePreamp(eq.preamp);
+      // Pre-amp / pre-gain (separate immediate frame, no commit).
+      await bridge.hidSendRaw(T02_REPORT_ID, preampFrame(eq.preamp));
     } finally {
       set({ status: "connected" });
     }
