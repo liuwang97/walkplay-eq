@@ -28,5 +28,7 @@ anyhow = "1"
 thiserror = "2"
 hidapi = "2"
 serialport = "4"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 walkplay-dac-protocol = { path = "../crates/walkplay-dac-protocol" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures-util = "0.3"

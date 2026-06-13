@@ -12,11 +12,28 @@ mod hid;
 use std::sync::Mutex;
 
 use hid::{ConnStatus, HidManager, HidState};
+use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
+
+/// A tray-facing preset entry (mirrors `TrayPreset` in TS). The native "Quick
+/// EQ" submenu is rebuilt from these whenever the UI pushes a new list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrayPreset {
+    pub id: String,
+    pub name: String,
+}
+
+/// Managed state holding the latest preset list the UI pushed to the tray.
+#[derive(Default)]
+pub struct TrayPresetState(pub Mutex<Vec<TrayPreset>>);
+
+/// Prefix used on dynamic "Quick EQ" menu item ids so the click handler can tell
+/// them apart from the static items and recover the preset id.
+const QUICK_EQ_PREFIX: &str = "quick_eq::";
 
 /// Show & focus the main window, creating nothing (it always exists, hidden).
 fn show_main_window(app: &AppHandle) {
@@ -63,15 +80,29 @@ fn set_tray_status(app: AppHandle, state: State<'_, HidState>, status: ConnStatu
     refresh_tray_status(&app, status);
 }
 
-/// Build the tray menu. "Quick EQ" is a placeholder submenu later agents fill.
-fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+/// Build the tray menu, with the "Quick EQ" submenu populated from `presets`.
+///
+/// Each preset becomes a menu item with id `quick_eq::<preset_id>`; clicking it
+/// emits the `apply-preset` event (payload = preset id) the WebView listens for.
+fn build_tray_menu(app: &AppHandle, presets: &[TrayPreset]) -> tauri::Result<Menu<tauri::Wry>> {
     let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, "hide", "Hide Window", true, None::<&str>)?;
 
-    let quick_placeholder =
-        MenuItem::with_id(app, "quick_eq_placeholder", "(presets)", false, None::<&str>)?;
-    let quick_eq =
-        Submenu::with_id_and_items(app, "quick_eq", "Quick EQ", true, &[&quick_placeholder])?;
+    // Dynamic quick-EQ items (or a disabled placeholder when none are loaded).
+    let quick_eq = if presets.is_empty() {
+        let placeholder =
+            MenuItem::with_id(app, "quick_eq_placeholder", "(no presets)", false, None::<&str>)?;
+        Submenu::with_id_and_items(app, "quick_eq", "Quick EQ", true, &[&placeholder])?
+    } else {
+        let mut items: Vec<MenuItem<tauri::Wry>> = Vec::with_capacity(presets.len());
+        for p in presets {
+            let id = format!("{QUICK_EQ_PREFIX}{}", p.id);
+            items.push(MenuItem::with_id(app, &id, &p.name, true, None::<&str>)?);
+        }
+        let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+            items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<tauri::Wry>).collect();
+        Submenu::with_id_and_items(app, "quick_eq", "Quick EQ", true, &refs)?
+    };
 
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -85,8 +116,32 @@ fn on_menu_event(app: &AppHandle, id: &str) {
         "show" => show_main_window(app),
         "hide" => hide_main_window(app),
         "quit" => app.exit(0),
-        _ => { /* quick_eq placeholders - filled by EQ/PRESETS agents */ }
+        other => {
+            // A dynamic "Quick EQ" preset item -> tell the WebView to apply it.
+            if let Some(preset_id) = other.strip_prefix(QUICK_EQ_PREFIX) {
+                let _ = app.emit("apply-preset", preset_id.to_string());
+            }
+        }
     }
+}
+
+/// Command: the UI pushes its current preset list; we store it and rebuild the
+/// tray menu so the "Quick EQ" submenu reflects the live presets.
+#[tauri::command]
+fn set_tray_presets(
+    app: AppHandle,
+    state: State<'_, TrayPresetState>,
+    presets: Vec<TrayPreset>,
+) -> Result<(), String> {
+    {
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        *guard = presets.clone();
+    }
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let menu = build_tray_menu(&app, &presets).map_err(|e| e.to_string())?;
+        tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -102,11 +157,13 @@ pub fn run() {
             Some(vec![]),
         ))
         .manage::<HidState>(Mutex::new(HidManager::default()))
+        .manage(TrayPresetState::default())
         .setup(|app| {
             let handle = app.handle();
 
-            // Tray with menu + status tooltip.
-            let menu = build_tray_menu(handle)?;
+            // Tray with menu + status tooltip. The "Quick EQ" submenu starts
+            // empty and is rebuilt when the UI calls `set_tray_presets`.
+            let menu = build_tray_menu(handle, &[])?;
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("Walkplay EQ - Disconnected")
@@ -149,6 +206,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_tray_status,
+            set_tray_presets,
             hid::hid_connect,
             hid::hid_disconnect,
             hid::hid_read_eq,
