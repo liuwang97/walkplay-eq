@@ -77,6 +77,8 @@ export interface EqStoreState {
   presets: Preset[];
   /** Id of the most recently applied preset (drives selection + tray check). */
   currentPresetId: string | null;
+  /** True when the live EQ has unsaved edits relative to the selected preset. */
+  dirty: boolean;
   /** True once the native event bridge has been wired (see {@link init}). */
   bridgeReady: boolean;
 
@@ -129,6 +131,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     ...loadCustomPresets(),
   ],
   currentPresetId: null,
+  dirty: false,
   bridgeReady: false,
 
   init: async () => {
@@ -173,8 +176,9 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
 
   setBand: (id, patch) => {
     set((s) => ({
-      // A manual edit detaches the EQ from any selected preset.
-      currentPresetId: null,
+      // A manual edit marks the EQ dirty but keeps the selected preset so
+      // "更新自定义EQ" can write the tweaks back to it.
+      dirty: true,
       eq: {
         ...s.eq,
         bands: s.eq.bands.map((b) => (b.id === id ? { ...b, ...patch } : b)),
@@ -184,13 +188,14 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
   },
 
   setPreamp: (preamp) => {
-    set((s) => ({ currentPresetId: null, eq: { ...s.eq, preamp } }));
+    set((s) => ({ dirty: true, eq: { ...s.eq, preamp } }));
     schedulePush(get);
   },
 
   applyPreset: (preset) => {
     set(() => ({
       currentPresetId: preset.id,
+      dirty: false,
       eq: { bands: preset.bands.map((b) => ({ ...b })), preamp: preset.preamp },
     }));
     // If connected, applying a preset should also reach the hardware.
@@ -220,7 +225,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
       source: "custom",
     };
     const next = [...presets, preset];
-    set({ presets: next, currentPresetId: id });
+    set({ presets: next, currentPresetId: id, dirty: false });
     persistCustomPresets(next);
     if (bridge.isTauri()) {
       void bridge.setTrayPresets(next.map((p) => ({ id: p.id, name: p.name }))).catch(() => {});
@@ -235,7 +240,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     const next = presets.map((p, i) =>
       i === idx ? { ...p, bands: eq.bands.map((b) => ({ ...b })), preamp: eq.preamp } : p,
     );
-    set({ presets: next });
+    set({ presets: next, dirty: false });
     persistCustomPresets(next);
     return true;
   },

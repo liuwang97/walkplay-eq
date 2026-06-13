@@ -109,16 +109,55 @@ const SPECS: readonly BuiltinSpec[] = [
 ];
 
 /**
+ * Full per-band presets (specific freq/Q/type per band, not derived from
+ * DEFAULT_BANDS). Used for device-tuned AutoEQ curves imported from the official
+ * app — these map 1:1 onto the T02's 8 bands.
+ */
+function band(
+  id: number,
+  freq: number,
+  q: number,
+  gain: number,
+  type: EqBand["type"],
+): EqBand {
+  return { id, freq, q, gain, type, enabled: true };
+}
+
+const FULL_PRESETS: readonly Preset[] = [
+  {
+    // Sony WH-1000XM5, AutoEQ Harman-target tuning — imported verbatim from the
+    // official WalkPlay app's custom preset "WH1000XM5 AutoEQ哈曼曲线2025".
+    id: "builtin-wh1000xm5-autoeq-harman-2025",
+    name: "WH-1000XM5 AutoEQ 哈曼2025",
+    preamp: -6,
+    source: "preset" as const,
+    bands: [
+      band(0, 105, 0.71, 6.1, "LS"),
+      band(1, 220, 1.2, -7, "PK"),
+      band(2, 1170, 2, 1.9, "PK"),
+      band(3, 1800, 3, -1.9, "PK"),
+      band(4, 2230, 1.4, 6.1, "PK"),
+      band(5, 3200, 1.8, -1, "PK"),
+      band(6, 6200, 3.3, -1.6, "PK"),
+      band(7, 10000, 1.2, 3.8, "PK"),
+    ],
+  },
+];
+
+/**
  * The built-in preset library. Marked `source: "preset"` so the panel renders
  * the 预设 badge and never offers a delete/edit affordance for them.
  */
-export const BUILTIN_PRESETS: readonly Preset[] = SPECS.map((s) => ({
-  id: s.id,
-  name: s.i18nKey,
-  bands: bands(s.curve),
-  preamp: s.preamp,
-  source: "preset" as const,
-}));
+export const BUILTIN_PRESETS: readonly Preset[] = [
+  ...SPECS.map((s) => ({
+    id: s.id,
+    name: s.i18nKey,
+    bands: bands(s.curve),
+    preamp: s.preamp,
+    source: "preset" as const,
+  })),
+  ...FULL_PRESETS,
+];
 
 /** zh fallback labels keyed by i18n key, for when a translation is missing. */
 export const BUILTIN_FALLBACK_LABELS: Readonly<Record<string, string>> =
