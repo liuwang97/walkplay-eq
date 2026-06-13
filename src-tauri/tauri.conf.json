@@ -12,9 +12,14 @@
   "app": {
     "windows": [
       {
-        "title": "walkplay-eq",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Walkplay EQ",
+        "width": 980,
+        "height": 680,
+        "minWidth": 720,
+        "minHeight": 520,
+        "visible": false,
+        "resizable": true
       }
     ],
     "security": {

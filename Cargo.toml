@@ -1,0 +1,7 @@
+# Top-level Cargo workspace.
+#
+# Tauri builds from `src-tauri`, but cargo walks upward and finds this root,
+# so the Tauri app and the protocol crate share one lockfile / target dir.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/walkplay-dac-protocol"]

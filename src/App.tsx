@@ -1,50 +1,38 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { Toaster } from "@/components/ui/sonner";
+import { EqPanel } from "@/features/eq/EqPanel";
+import { ResponseCurve } from "@/features/curve/ResponseCurve";
+import { PresetPanel } from "@/features/presets/PresetPanel";
+import { useEqStore } from "@/lib/store";
+import "@/i18n";
+
+const queryClient = new QueryClient();
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
-
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  const status = useEqStore((s) => s.status);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <div className="dark min-h-screen bg-background text-foreground">
+          <div className="mx-auto flex max-w-5xl flex-col gap-4 p-4">
+            <header className="flex items-center justify-between">
+              <h1 className="text-lg font-semibold">Walkplay EQ</h1>
+              <span className="text-xs text-muted-foreground capitalize">{status}</span>
+            </header>
+            <main className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+              <div className="flex flex-col gap-4 lg:col-span-2">
+                <ResponseCurve />
+                <EqPanel />
+              </div>
+              <PresetPanel />
+            </main>
+          </div>
+          <Toaster />
+        </div>
+      </TooltipProvider>
+    </QueryClientProvider>
   );
 }
 

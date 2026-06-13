@@ -1,0 +1,12 @@
+[package]
+name = "walkplay-dac-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Wire protocol for Walkplay DAC custom HID Output Reports (PEQ)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lib]
+name = "walkplay_dac_protocol"
+path = "src/lib.rs"
