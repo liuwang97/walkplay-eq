@@ -94,27 +94,49 @@ export function FirmwareDialog() {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button size="sm" variant="outline" disabled={!device}>
-          <CpuIcon />
-          {t(K.firmware.upgrade)}
-        </Button>
+        {/* Porcelain icon button — settings/firmware entry in the title bar. */}
+        <button
+          type="button"
+          disabled={!device}
+          title={t(K.firmware.upgrade)}
+          aria-label={t(K.firmware.upgrade)}
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 8,
+            border: "1px solid rgba(28,32,58,0.10)",
+            background: "#fff",
+            display: "grid",
+            placeItems: "center",
+            cursor: device ? "pointer" : "not-allowed",
+            color: "#6b7184",
+            opacity: device ? 1 : 0.45,
+          }}
+        >
+          <CpuIcon style={{ width: 15, height: 15 }} />
+        </button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent
+        className="sm:max-w-md gap-4 border-[rgba(28,32,58,0.08)] bg-white text-[#1b1f2e] shadow-[0_30px_70px_-24px_rgba(28,32,58,0.4)]"
+        style={{ fontFamily: "'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif" }}
+      >
         <DialogHeader>
-          <DialogTitle>{t(K.firmware.title)}</DialogTitle>
-          <DialogDescription>{t(K.firmware.doNotDisconnect)}</DialogDescription>
+          <DialogTitle className="text-[#1b1f2e]">{t(K.firmware.title)}</DialogTitle>
+          <DialogDescription className="text-[#8a90a3]">
+            {t(K.firmware.doNotDisconnect)}
+          </DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-3 text-sm">
           {checking && (
-            <div className="flex items-center gap-2 text-muted-foreground">
+            <div className="flex items-center gap-2 text-[#8a90a3]">
               <Loader2Icon className="size-4 animate-spin" />
               {t(K.firmware.loadingFirmware)}
             </div>
           )}
 
           {check && (
-            <div className="flex flex-col gap-1 rounded-md border border-border/60 p-3">
+            <div className="flex flex-col gap-1 rounded-[12px] border border-[rgba(28,32,58,0.07)] bg-[#fafbfd] p-3">
               <Row label={t(K.firmware.currentVersion)} value={check.current} />
               <Row label={t(K.firmware.latestVersion)} value={check.latest ?? "—"} />
               <Row
@@ -130,25 +152,28 @@ export function FirmwareDialog() {
 
           {progress && (
             <div className="flex flex-col gap-1">
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <div className="flex items-center justify-between text-xs text-[#8a90a3]">
                 <span className="capitalize">{progress.phase}</span>
                 <span>{progress.percent}%</span>
               </div>
-              <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+              <div className="h-2 w-full overflow-hidden rounded-full bg-[rgba(28,32,58,0.08)]">
                 <div
-                  className="h-full rounded-full bg-primary transition-all"
-                  style={{ width: `${progress.percent}%` }}
+                  className="h-full rounded-full transition-all"
+                  style={{
+                    width: `${progress.percent}%`,
+                    background: "linear-gradient(135deg, #2f6bff, #6a4cff)",
+                  }}
                 />
               </div>
-              <span className="truncate text-[11px] text-muted-foreground">
+              <span className="truncate text-[11px] text-[#8a90a3]">
                 {progress.message}
                 {progress.dry_run ? " (dry run)" : ""}
               </span>
             </div>
           )}
 
-          <label className="flex items-center justify-between rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2">
-            <span className="text-xs text-amber-300/90">
+          <label className="flex items-center justify-between rounded-[12px] border border-amber-500/30 bg-amber-500/[0.08] px-3 py-2">
+            <span className="text-xs font-medium text-amber-700">
               {t(K.firmware.startUpgrade)} ({t(K.errors.confirmContinue)})
             </span>
             <Switch checked={confirmFlash} onCheckedChange={setConfirmFlash} />
@@ -156,13 +181,21 @@ export function FirmwareDialog() {
         </div>
 
         <DialogFooter>
-          <Button variant="ghost" size="sm" onClick={runCheck} disabled={checking || running}>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={runCheck}
+            disabled={checking || running}
+            className="text-[#4a5061] hover:bg-[rgba(28,32,58,0.05)]"
+          >
             {t(K.firmware.checkVersion)}
           </Button>
           <Button
             size="sm"
             onClick={runUpgrade}
             disabled={running || !check?.url}
+            className="border-0 text-white shadow-[0_2px_8px_-2px_rgba(47,107,255,0.5)] hover:opacity-90"
+            style={{ background: "linear-gradient(135deg, #2f6bff, #6a4cff)" }}
           >
             {running ? <Loader2Icon className="animate-spin" /> : <DownloadIcon />}
             {running ? t(K.firmware.upgrading) : t(K.firmware.startUpgrade)}
@@ -176,8 +209,8 @@ export function FirmwareDialog() {
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-4">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="font-mono tabular-nums">{value}</span>
+      <span className="text-[#8a90a3]">{label}</span>
+      <span className="font-mono tabular-nums text-[#1b1f2e]">{value}</span>
     </div>
   );
 }

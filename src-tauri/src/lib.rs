@@ -165,7 +165,9 @@ pub fn run() {
             // empty and is rebuilt when the UI calls `set_tray_presets`.
             let menu = build_tray_menu(handle, &[])?;
             let _tray = TrayIconBuilder::with_id("main-tray")
-                .icon(app.default_window_icon().unwrap().clone())
+                // Dedicated tray glyph (bolder bars, legible at 16px) instead of
+                // the full app icon. Embedded at compile time.
+                .icon(tauri::include_image!("./icons/tray.png"))
                 .tooltip("Walkplay EQ - Disconnected")
                 .menu(&menu)
                 .show_menu_on_left_click(false)

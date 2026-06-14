@@ -32,3 +32,6 @@ validate*.cjs
 sweepfs.cjs
 shelf-fix.cjs
 src-tauri/examples/probe.rs
+
+# Claude Design handoff bundle (reference only, not source)
+design-ref/

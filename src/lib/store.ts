@@ -10,6 +10,7 @@ import { create } from "zustand";
 import * as bridge from "./bridge";
 import { BUILTIN_PRESETS } from "@/features/presets/builtins";
 import { buildProgram, preampFrame, T02_REPORT_ID } from "@/features/eq/t02-protocol";
+import { ACCENT_KEYS, type AccentKey } from "./theme";
 import {
   DEFAULT_EQ_STATE,
   type ConnStatus,
@@ -21,6 +22,22 @@ import {
 
 /** localStorage key holding the user's locally-saved custom presets. */
 const CUSTOM_KEY = "walkplay.customPresets";
+/** localStorage key holding the user's chosen accent color. */
+const ACCENT_KEY = "walkplay.accent";
+
+function loadAccent(): AccentKey {
+  try {
+    const raw = localStorage.getItem(ACCENT_KEY) as AccentKey | null;
+    return raw && ACCENT_KEYS.includes(raw) ? raw : "azure";
+  } catch {
+    return "azure";
+  }
+}
+
+/** A flat (all gains 0, preamp 0) copy of an EQ — used for master-bypass push. */
+function flatten(eq: EqState): EqState {
+  return { bands: eq.bands.map((b) => ({ ...b, gain: 0 })), preamp: 0 };
+}
 
 function loadCustomPresets(): Preset[] {
   try {
@@ -88,6 +105,21 @@ export interface EqStoreState {
    */
   autoConnect: boolean;
 
+  // --- Redesign UI state (porcelain instrument) ---
+  /** Index of the band selected in the instrument / inspector. */
+  selected: number;
+  /** Master EQ on/off. When off, a flat program is pushed (device bypass). */
+  masterOn: boolean;
+  /** Active accent color (persisted). */
+  accent: AccentKey;
+  /** A/B compare: which slot is live. */
+  activeSlot: "A" | "B";
+  /**
+   * The stashed (inactive) slot's EQ. `eq` always mirrors the active slot;
+   * switching slots swaps `eq` <-> `slotStash`. Null until B is first used.
+   */
+  slotStash: EqState | null;
+
   // --- Lifecycle ---
   /**
    * Subscribe to the native `conn-status` / `apply-preset` events and seed the
@@ -117,6 +149,18 @@ export interface EqStoreState {
   /** Delete a custom preset by id. Returns false if not found / not custom. */
   deleteCustom: (id: string) => boolean;
 
+  // --- Redesign UI actions ---
+  /** Select a band (instrument node / fader / inspector focus). */
+  setSelected: (i: number) => void;
+  /** Toggle master EQ on/off (off pushes a flat program to the device). */
+  toggleMaster: () => void;
+  /** Set the accent color (persisted). */
+  setAccent: (accent: AccentKey) => void;
+  /** Switch the live A/B slot, stashing the current one. */
+  setActiveSlot: (slot: "A" | "B") => void;
+  /** Copy the live EQ into the other A/B slot. */
+  copyToOtherSlot: () => void;
+
   // --- Device-touching actions (delegate to bridge) ---
   /** Connect to a device (auto-picks primary when vid/pid omitted). */
   connect: (vid?: number, pid?: number) => Promise<void>;
@@ -144,6 +188,11 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
   dirty: false,
   bridgeReady: false,
   autoConnect: true,
+  selected: 4,
+  masterOn: true,
+  accent: loadAccent(),
+  activeSlot: "A",
+  slotStash: null,
 
   init: async () => {
     if (!bridge.isTauri()) {
@@ -313,6 +362,48 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     return true;
   },
 
+  setSelected: (i) => set({ selected: i }),
+
+  toggleMaster: () => {
+    set((s) => ({ masterOn: !s.masterOn }));
+    // Re-push so the device reflects bypass / re-engage immediately.
+    if (get().status === "connected" || get().status === "busy") {
+      void get().pushToDevice().catch(() => {});
+    }
+  },
+
+  setAccent: (accent) => {
+    set({ accent });
+    try {
+      localStorage.setItem(ACCENT_KEY, accent);
+    } catch {
+      /* storage unavailable — non-fatal */
+    }
+  },
+
+  setActiveSlot: (slot) => {
+    const s = get();
+    if (slot === s.activeSlot) return;
+    // Swap the live EQ with the stash; seed B from A the first time.
+    const incoming = s.slotStash ?? {
+      bands: s.eq.bands.map((b) => ({ ...b })),
+      preamp: s.eq.preamp,
+    };
+    set({
+      activeSlot: slot,
+      slotStash: { bands: s.eq.bands.map((b) => ({ ...b })), preamp: s.eq.preamp },
+      eq: { bands: incoming.bands.map((b) => ({ ...b })), preamp: incoming.preamp },
+      currentPresetId: null,
+      dirty: false,
+    });
+    schedulePush(get);
+  },
+
+  copyToOtherSlot: () => {
+    const s = get();
+    set({ slotStash: { bands: s.eq.bands.map((b) => ({ ...b })), preamp: s.eq.preamp } });
+  },
+
   connect: async (vid, pid) => {
     // A (re)connect re-arms auto-connect for future hot-plug events.
     set({ status: "connecting", autoConnect: true });
@@ -349,10 +440,12 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
 
   pushToDevice: async () => {
     if (!bridge.isTauri()) return;
-    const { eq } = get();
+    const s = get();
+    // Master off = device bypass: stream a flat program instead of the live EQ.
+    const eq = s.masterOn ? s.eq : flatten(s.eq);
     set({ status: "busy" });
     try {
-      // T02-family protocol: stream the full 8-band biquad program + commit.
+      // T02-family protocol: stream the full biquad program + commit.
       // (See src/features/eq/t02-protocol.ts — validated against the official app.)
       const frames = buildProgram(eq.bands);
       for (const frame of frames) {

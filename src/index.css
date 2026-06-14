@@ -123,3 +123,51 @@
     height: 100%;
   }
 }
+
+/* ============================================================
+ * WalkPlay EQ — porcelain (macOS-grade light) design system.
+ * The redesigned UI is inline-styled for pixel fidelity; these
+ * are the global primitives it relies on (fonts, backdrop,
+ * scrollbar). Ported from the Claude Design handoff.
+ * ============================================================ */
+:root {
+  --wp-ink: #1b1f2e;
+  --wp-muted: #8a90a3;
+  --wp-cut: #7c8398;
+  --wp-line: rgba(28, 32, 58, 0.08);
+  --wp-surface: #ffffff;
+  --font-sans: "Manrope", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+
+html,
+body,
+#root {
+  background: #e9ebf1;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--wp-ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Soft pearl scrollbar used by the switcher + any porcelain scroll area. */
+.wp-scroll::-webkit-scrollbar {
+  width: 9px;
+}
+.wp-scroll::-webkit-scrollbar-thumb {
+  background: rgba(28, 32, 48, 0.16);
+  border-radius: 99px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+.wp-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(28, 32, 48, 0.28);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+.wp-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
