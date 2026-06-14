@@ -21,10 +21,19 @@ use tauri::{
 
 /// A tray-facing preset entry (mirrors `TrayPreset` in TS). The native "Quick
 /// EQ" submenu is rebuilt from these whenever the UI pushes a new list.
+///
+/// Carries the preset's precomputed program `frames` (+ `report_id`) so the tray
+/// can apply a preset on the device directly when no window is open — the WebView
+/// that normally builds the frames has been destroyed on close.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TrayPreset {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub report_id: Option<u8>,
+    #[serde(default)]
+    pub frames: Vec<Vec<u8>>,
 }
 
 /// Managed state holding the latest preset list the UI pushed to the tray.
@@ -134,12 +143,36 @@ fn on_menu_event(app: &AppHandle, id: &str) {
         "hide" => hide_main_window(app),
         "quit" => app.exit(0),
         other => {
-            // A dynamic "Quick EQ" preset item -> tell the WebView to apply it.
+            // A dynamic "Quick EQ" preset item.
             if let Some(preset_id) = other.strip_prefix(QUICK_EQ_PREFIX) {
+                // Tell an open window so its UI reflects the change.
                 let _ = app.emit("apply-preset", preset_id.to_string());
+                // With no window open, the WebView can't apply it — push the
+                // preset's precomputed frames to the device from the backend.
+                if app.get_webview_window("main").is_none() {
+                    apply_tray_preset(app, preset_id);
+                }
             }
         }
     }
+}
+
+/// Apply a tray preset's stored program directly on the device (used when no
+/// window is open). Looks up the cached frames and hands them to the HID layer,
+/// which writes them and records them as the active program for hot-plug replay.
+fn apply_tray_preset(app: &AppHandle, preset_id: &str) {
+    let entry = {
+        let guard = app.state::<TrayPresetState>();
+        let presets = guard.0.lock().ok();
+        presets.and_then(|p| p.iter().find(|x| x.id == preset_id).cloned())
+    };
+    let Some(p) = entry else { return };
+    let Some(report_id) = p.report_id else { return };
+    if p.frames.is_empty() {
+        return;
+    }
+    let hid_state = app.state::<HidState>();
+    hid::apply_program(&hid_state, report_id, &p.frames);
 }
 
 /// Command: the UI pushes its current preset list; we store it and rebuild the

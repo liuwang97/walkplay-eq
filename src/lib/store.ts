@@ -117,6 +117,20 @@ function schedulePush(get: () => EqStoreState): void {
   }, 60);
 }
 
+/**
+ * Build the tray-preset payload: id + name + the precomputed T02 program frames.
+ * The native tray needs the frames so it can apply a preset directly on the
+ * device when no window is open (the WebView that normally builds them is gone).
+ */
+function trayPayload(presets: Preset[]): bridge.TrayPreset[] {
+  return presets.map((p) => ({
+    id: p.id,
+    name: p.name,
+    reportId: T02_REPORT_ID,
+    frames: [...buildProgram(p.bands), preampFrame(p.preamp)],
+  }));
+}
+
 function newPresetId(): string {
   try {
     return "custom-" + crypto.randomUUID();
@@ -270,7 +284,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
 
     // Seed the tray submenu with the current preset library.
     await bridge
-      .setTrayPresets(get().presets.map((p) => ({ id: p.id, name: p.name })))
+      .setTrayPresets(trayPayload(get().presets))
       .catch(() => {});
 
     // Seed connection state from the backend: it owns the auto-connect / hot-plug
@@ -324,7 +338,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     set({ presets });
     if (bridge.isTauri()) {
       void bridge
-        .setTrayPresets(presets.map((p) => ({ id: p.id, name: p.name })))
+        .setTrayPresets(trayPayload(presets))
         .catch(() => {});
     }
   },
@@ -344,7 +358,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     set({ presets: next, currentPresetId: id, dirty: false });
     persistCustomPresets(next);
     if (bridge.isTauri()) {
-      void bridge.setTrayPresets(next.map((p) => ({ id: p.id, name: p.name }))).catch(() => {});
+      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
     }
     return id;
   },
@@ -358,6 +372,10 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     );
     set({ presets: next, dirty: false });
     persistCustomPresets(next);
+    // Refresh the tray frames so a tray apply uses the updated EQ.
+    if (bridge.isTauri()) {
+      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
+    }
     return true;
   },
 
@@ -371,7 +389,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     set({ presets: next });
     persistCustomPresets(next);
     if (bridge.isTauri()) {
-      void bridge.setTrayPresets(next.map((p) => ({ id: p.id, name: p.name }))).catch(() => {});
+      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
     }
     return true;
   },
@@ -388,7 +406,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     });
     persistCustomPresets(next);
     if (bridge.isTauri()) {
-      void bridge.setTrayPresets(next.map((p) => ({ id: p.id, name: p.name }))).catch(() => {});
+      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
     }
     return true;
   },

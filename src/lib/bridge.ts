@@ -145,6 +145,14 @@ export function fwUpgrade(url: string, confirmed = false): Promise<FirmwareUpgra
 export interface TrayPreset {
   id: string;
   name: string;
+  /** HID report id for {@link frames} (T02 = 75). Lets the tray apply this preset. */
+  reportId?: number;
+  /**
+   * The full precomputed program (band frames + commit + preamp) for this preset.
+   * The native tray uses these to apply the preset directly on the device when no
+   * window is open (the WebView, which normally builds them, has been destroyed).
+   */
+  frames?: number[][];
 }
 
 /**

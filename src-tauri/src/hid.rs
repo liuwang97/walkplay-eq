@@ -599,6 +599,25 @@ pub async fn hid_status(state: State<'_, HidState>) -> CmdResult<ConnStatusInfo>
     })
 }
 
+/// Apply a full program (write each frame to the device) and record it as the
+/// active program for hot-plug replay. Used by the tray "Quick EQ" handler when
+/// no window is open. No-op writes when disconnected, but still caches the
+/// program so the next (auto-)connect replays the just-selected preset.
+pub(crate) fn apply_program(state: &HidState, report_id: u8, frames: &[Vec<u8>]) {
+    let mut mgr = match state.lock() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if mgr.is_connected() {
+        let dev = mgr.hid.as_ref().expect("connected");
+        for f in frames {
+            let _ = write_report(dev, report_id, f);
+        }
+        mgr.last_io = Some(Instant::now());
+    }
+    mgr.program = frames.iter().map(|f| (report_id, f.clone())).collect();
+}
+
 /// Register the UI's current full EQ program (the exact frames it last pushed)
 /// so the background poller can replay it verbatim after a hot-plug reconnect.
 ///
