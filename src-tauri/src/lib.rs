@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, State,
 };
 
 /// A tray-facing preset entry (mirrors `TrayPreset` in TS). The native "Quick
@@ -35,12 +35,29 @@ pub struct TrayPresetState(pub Mutex<Vec<TrayPreset>>);
 /// them apart from the static items and recover the preset id.
 const QUICK_EQ_PREFIX: &str = "quick_eq::";
 
-/// Show & focus the main window, creating nothing (it always exists, hidden).
+/// Show & focus the main window, rebuilding it if it was destroyed.
+///
+/// Closing the window destroys its WebView (to free memory), so on the next
+/// "show" the window may not exist — we recreate it from the configured "main"
+/// window settings so size/decorations stay identical.
 fn show_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
+        return;
+    }
+    if let Some(cfg) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .cloned()
+    {
+        if let Ok(builder) = tauri::WebviewWindowBuilder::from_config(app, &cfg) {
+            let _ = builder.build();
+        }
     }
 }
 
@@ -197,15 +214,25 @@ pub fn run() {
                 let _ = win.hide();
             }
 
+            // Background auto-connect / hot-plug poller. Owns the connection
+            // lifecycle in Rust so it keeps working even when no window exists
+            // (the window is destroyed on close to free WebView memory).
+            {
+                let app = handle.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let state = app.state::<HidState>();
+                    if let Some(status) = hid::background_poll_tick(&app, &state) {
+                        refresh_tray_status(&app, status);
+                    }
+                });
+            }
+
             Ok(())
         })
-        // Closing the window hides it instead of quitting (tray keeps running).
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-            }
-        })
+        // NB: no `on_window_event` close handler — letting the close proceed
+        // destroys the window's WebView (freeing its memory). The app is kept
+        // alive in the tray by the `ExitRequested` guard in `run()` below.
         .invoke_handler(tauri::generate_handler![
             set_tray_status,
             set_tray_presets,
@@ -217,9 +244,21 @@ pub fn run() {
             hid::hid_write_preamp,
             hid::hid_factory_reset,
             hid::hid_list_devices,
+            hid::hid_status,
+            hid::hid_set_program,
             firmware::fw_check,
             firmware::fw_upgrade,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // When the last window is closed (code == None), stay resident in the
+            // tray instead of exiting. The tray "Quit" item calls `app.exit(0)`
+            // (code == Some(0)), which is allowed to proceed.
+            if let RunEvent::ExitRequested { code, api, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }

@@ -88,6 +88,30 @@ export function hidSendRaw(reportId: number, data: number[]): Promise<void> {
   return invoke<void>("hid_send_raw", { reportId, data });
 }
 
+/**
+ * Register the current full EQ program (the exact frames last pushed) with the
+ * backend, so its background poller can replay them verbatim after a hot-plug
+ * reconnect — keeping the device's sound while no window is open.
+ */
+export function hidSetProgram(reportId: number, frames: number[][]): Promise<void> {
+  return invoke<void>("hid_set_program", { reportId, frames });
+}
+
+/** Current connection snapshot (mirrors Rust `ConnStatusInfo`). */
+export interface ConnStatusInfo {
+  status: ConnStatus;
+  device?: DeviceInfo;
+}
+
+/**
+ * Read the live connection status + open device from the backend. Used by a
+ * freshly (re)created window to seed its store — the backend may already be
+ * connected (or have reconnected in the background) while no window existed.
+ */
+export function hidStatus(): Promise<ConnStatusInfo> {
+  return invoke<ConnStatusInfo>("hid_status");
+}
+
 /** Reset the device EQ to factory defaults. */
 export function hidFactoryReset(): Promise<void> {
   return invoke<void>("hid_factory_reset");

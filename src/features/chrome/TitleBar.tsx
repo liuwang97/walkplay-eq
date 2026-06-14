@@ -38,7 +38,7 @@ const TRAFFIC = [
 function windowAction(action: "close" | "minimize" | "maximize"): void {
   if (!isTauri()) return;
   const win = getCurrentWindow();
-  if (action === "close") void win.close(); // CloseRequested -> hide to tray
+  if (action === "close") void win.close(); // destroys the WebView; app stays in the tray
   else if (action === "minimize") void win.minimize();
   else void win.toggleMaximize();
 }

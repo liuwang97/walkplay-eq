@@ -167,7 +167,6 @@ fn ui_band_to_wire(b: &EqBand) -> proto::EqBandWire {
 ///
 /// Wrapped in a `Mutex` and registered as Tauri managed state so every command
 /// shares the same single connection.
-#[derive(Default)]
 pub struct HidManager {
     pub status: ConnStatus,
     pub device: Option<DeviceInfo>,
@@ -180,6 +179,29 @@ pub struct HidManager {
     pub cached_eq: Option<EqState>,
     /// Timestamp of the last successful device I/O (keep-alive bookkeeping).
     pub last_io: Option<Instant>,
+    /// Whether the background poller should auto-connect on device presence.
+    /// Set `false` by an explicit user disconnect, re-armed on any connect.
+    pub auto_connect: bool,
+    /// The last full program the UI pushed: a list of `(report_id, payload)`
+    /// frames. Replayed verbatim after a background hot-plug reconnect so the
+    /// user's EQ survives unplug/replug even with no window open.
+    pub program: Vec<(u8, Vec<u8>)>,
+}
+
+impl Default for HidManager {
+    fn default() -> Self {
+        HidManager {
+            status: ConnStatus::default(),
+            device: None,
+            hid: None,
+            codec: None,
+            cached_eq: None,
+            last_io: None,
+            // Auto-connect is on by default; only an explicit disconnect disarms it.
+            auto_connect: true,
+            program: Vec::new(),
+        }
+    }
 }
 
 impl HidManager {
@@ -188,7 +210,8 @@ impl HidManager {
         self.hid.is_some()
     }
 
-    /// Drop the handle and reset to disconnected.
+    /// Drop the handle and reset to disconnected. Keeps `auto_connect` and the
+    /// cached `program` so the background poller can reconnect + replay.
     fn clear_connection(&mut self) {
         self.hid = None;
         self.device = None;
@@ -364,29 +387,32 @@ pub async fn hid_list_devices(state: State<'_, HidState>) -> CmdResult<Vec<Devic
     Ok(devices)
 }
 
-/// Open and handshake with a device.
+/// Open + handshake a device and store the live handle. Shared by the
+/// `hid_connect` command and the background auto-connect poller.
 ///
 /// `vid`/`pid` are optional — when both are `None` we auto-pick: the primary
 /// 0x0666/0x0888 if present, otherwise the first whitelisted device found.
 ///
+/// On success, replays the cached `program` (the UI's last full EQ push) so the
+/// device's sound is restored after a hot-plug reconnect with no window open.
+///
 /// Emits `conn-status` = `connecting` then `connected` (or back to
 /// `disconnected` on failure).
-#[tauri::command]
-pub async fn hid_connect(
-    app: AppHandle,
-    state: State<'_, HidState>,
+pub(crate) fn connect_device(
+    app: &AppHandle,
+    state: &HidState,
     vid: Option<u16>,
     pid: Option<u16>,
 ) -> CmdResult<DeviceInfo> {
     // If something is already open, close it first (single-handle invariant).
     {
-        let mut mgr = lock(&state)?;
+        let mut mgr = lock(state)?;
         if mgr.is_connected() {
             mgr.clear_connection();
         }
     }
 
-    set_status_and_emit(&app, &state, ConnStatus::Connecting)?;
+    set_status_and_emit(app, state, ConnStatus::Connecting)?;
 
     // Resolve which device to open.
     let resolve = || -> CmdResult<(u16, u16)> {
@@ -406,7 +432,7 @@ pub async fn hid_connect(
     let (v, p) = match resolve() {
         Ok(t) => t,
         Err(e) => {
-            let _ = set_status_and_emit(&app, &state, ConnStatus::Disconnected);
+            let _ = set_status_and_emit(app, state, ConnStatus::Disconnected);
             return Err(e);
         }
     };
@@ -415,7 +441,7 @@ pub async fn hid_connect(
     let dev = match open_device(v, p) {
         Ok(d) => d,
         Err(e) => {
-            let _ = set_status_and_emit(&app, &state, ConnStatus::Disconnected);
+            let _ = set_status_and_emit(app, state, ConnStatus::Disconnected);
             return Err(e);
         }
     };
@@ -425,7 +451,7 @@ pub async fn hid_connect(
 
     // NEEDS HARDWARE: confirm the device acks the handshake before commands.
     if let Err(e) = send_handshake(&dev) {
-        let _ = set_status_and_emit(&app, &state, ConnStatus::Disconnected);
+        let _ = set_status_and_emit(app, state, ConnStatus::Disconnected);
         return Err(e);
     }
 
@@ -451,7 +477,7 @@ pub async fn hid_connect(
     };
 
     {
-        let mut mgr = lock(&state)?;
+        let mut mgr = lock(state)?;
         mgr.hid = Some(dev);
         mgr.device = Some(info.clone());
         // Primary device uses EQ base 32; other variants would override here.
@@ -459,20 +485,133 @@ pub async fn hid_connect(
         mgr.codec = Some(proto::Codec::new());
         mgr.last_io = Some(Instant::now());
         mgr.status = ConnStatus::Connected;
+
+        // Replay the UI's last program so the device sound survives a background
+        // hot-plug reconnect. No-op on a first connect (program empty); the UI's
+        // own pushToDevice will then populate it.
+        if !mgr.program.is_empty() {
+            let dev = mgr.hid.as_ref().expect("just set");
+            for (report_id, payload) in &mgr.program {
+                let _ = write_report(dev, *report_id, payload);
+            }
+        }
     }
 
     let _ = app.emit(CONN_STATUS_EVENT, ConnStatus::Connected);
     Ok(info)
 }
 
+/// One tick of the background auto-connect / hot-plug poller. Drives the whole
+/// connection lifecycle so it keeps working even when no window exists.
+///
+/// Returns `Some(status)` when the connection state transitioned this tick (so
+/// the caller can refresh the tray tooltip), else `None`. Never holds the state
+/// lock across device enumeration or HID I/O.
+pub(crate) fn background_poll_tick(app: &AppHandle, state: &HidState) -> Option<ConnStatus> {
+    let (status, auto_connect, open_id) = {
+        let mgr = state.lock().ok()?;
+        (
+            mgr.status,
+            mgr.auto_connect,
+            mgr.device.as_ref().map(|d| (d.vid, d.pid)),
+        )
+    };
+
+    match status {
+        // Disconnected (and not manually disarmed) -> connect if a device is present.
+        ConnStatus::Disconnected if auto_connect => {
+            let present = enumerate_devices().map(|d| !d.is_empty()).unwrap_or(false);
+            if present && connect_device(app, state, None, None).is_ok() {
+                return Some(ConnStatus::Connected);
+            }
+            None
+        }
+        // Connected -> watch for hot-unplug (open device no longer enumerable).
+        ConnStatus::Connected => {
+            let (vid, pid) = open_id?;
+            let gone = match enumerate_devices() {
+                Ok(list) => !list.iter().any(|d| d.vid == vid && d.pid == pid),
+                Err(_) => false, // transient enumeration error — don't tear down
+            };
+            if gone {
+                if let Ok(mut mgr) = state.lock() {
+                    mgr.clear_connection();
+                }
+                let _ = app.emit(CONN_STATUS_EVENT, ConnStatus::Disconnected);
+                return Some(ConnStatus::Disconnected);
+            }
+            None
+        }
+        // Connecting / Busy (e.g. firmware flash): leave the poller hands-off.
+        _ => None,
+    }
+}
+
+/// Open and handshake with a device (command wrapper around [`connect_device`]).
+///
+/// Re-arms auto-connect so future hot-plug events reconnect automatically.
+#[tauri::command]
+pub async fn hid_connect(
+    app: AppHandle,
+    state: State<'_, HidState>,
+    vid: Option<u16>,
+    pid: Option<u16>,
+) -> CmdResult<DeviceInfo> {
+    {
+        let mut mgr = lock(&state)?;
+        mgr.auto_connect = true;
+    }
+    connect_device(&app, &state, vid, pid)
+}
+
 /// Close the active connection. Idempotent.
+///
+/// This is an *explicit* user disconnect, so it disarms `auto_connect`: the
+/// background poller will not silently reconnect until the user connects again.
 #[tauri::command]
 pub async fn hid_disconnect(app: AppHandle, state: State<'_, HidState>) -> CmdResult<()> {
     {
         let mut mgr = lock(&state)?;
         mgr.clear_connection();
+        mgr.auto_connect = false;
     }
     let _ = app.emit(CONN_STATUS_EVENT, ConnStatus::Disconnected);
+    Ok(())
+}
+
+/// Current connection snapshot, for a freshly (re)created window to seed its
+/// store from — the backend may already be connected (or have reconnected in
+/// the background) while no window existed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnStatusInfo {
+    pub status: ConnStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceInfo>,
+}
+
+/// Return the live connection status + open device (if any).
+#[tauri::command]
+pub async fn hid_status(state: State<'_, HidState>) -> CmdResult<ConnStatusInfo> {
+    let mgr = lock(&state)?;
+    Ok(ConnStatusInfo {
+        status: mgr.status,
+        device: mgr.device.clone(),
+    })
+}
+
+/// Register the UI's current full EQ program (the exact frames it last pushed)
+/// so the background poller can replay it verbatim after a hot-plug reconnect.
+///
+/// All frames share one `report_id` (the T02 coeff protocol streams on a single
+/// report). Passing an empty list clears the cache (e.g. on factory reset).
+#[tauri::command]
+pub async fn hid_set_program(
+    state: State<'_, HidState>,
+    report_id: u8,
+    frames: Vec<Vec<u8>>,
+) -> CmdResult<()> {
+    let mut mgr = lock(&state)?;
+    mgr.program = frames.into_iter().map(|f| (report_id, f)).collect();
     Ok(())
 }
 
@@ -673,8 +812,10 @@ pub async fn hid_factory_reset(state: State<'_, HidState>) -> CmdResult<()> {
         let _ = write_report(dev, proto::COMMAND_REPORT, &proto::flush_to_flash_frame());
     }
 
-    // Reset the cache to flat defaults too.
+    // Reset the cache to flat defaults too, and drop the replay program so a
+    // later background reconnect doesn't re-apply the pre-reset EQ.
     mgr.cached_eq = Some(EqState::default());
+    mgr.program.clear();
     mgr.last_io = Some(Instant::now());
     Ok(())
 }

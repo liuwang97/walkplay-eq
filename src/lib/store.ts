@@ -24,6 +24,44 @@ import {
 const CUSTOM_KEY = "walkplay.customPresets";
 /** localStorage key holding the user's chosen accent color. */
 const ACCENT_KEY = "walkplay.accent";
+/** localStorage key holding the live "working" EQ (survives window destroy). */
+const WORKING_KEY = "walkplay.working";
+
+/** The persisted working snapshot — restored when a closed window is reopened. */
+interface WorkingSnapshot {
+  eq: EqState;
+  masterOn: boolean;
+  activeSlot: "A" | "B";
+  currentPresetId: string | null;
+}
+
+function loadWorking(): WorkingSnapshot | null {
+  try {
+    const raw = localStorage.getItem(WORKING_KEY);
+    if (!raw) return null;
+    const w = JSON.parse(raw);
+    if (!w || !w.eq || !Array.isArray(w.eq.bands)) return null;
+    return w as WorkingSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+function persistWorking(s: WorkingSnapshot): void {
+  try {
+    localStorage.setItem(
+      WORKING_KEY,
+      JSON.stringify({
+        eq: s.eq,
+        masterOn: s.masterOn,
+        activeSlot: s.activeSlot,
+        currentPresetId: s.currentPresetId,
+      }),
+    );
+  } catch {
+    /* storage unavailable — non-fatal */
+  }
+}
 
 function loadAccent(): AccentKey {
   try {
@@ -174,24 +212,31 @@ export interface EqStoreState {
   factoryReset: () => Promise<void>;
 }
 
+/** Working EQ restored at module load (used to seed the store's initial state). */
+const INITIAL_WORKING = loadWorking();
+
 export const useEqStore = create<EqStoreState>((set, get) => ({
   device: null,
   status: "disconnected",
-  eq: { bands: DEFAULT_EQ_STATE.bands.map((b) => ({ ...b })), preamp: DEFAULT_EQ_STATE.preamp },
+  // Restore the last working EQ so a reopened (recreated) window matches the
+  // EQ the backend replayed to the device. Falls back to a flat default.
+  eq: INITIAL_WORKING?.eq
+    ? { bands: INITIAL_WORKING.eq.bands.map((b) => ({ ...b })), preamp: INITIAL_WORKING.eq.preamp }
+    : { bands: DEFAULT_EQ_STATE.bands.map((b) => ({ ...b })), preamp: DEFAULT_EQ_STATE.preamp },
   // Seed the library with the built-in presets so both the panel and the tray
   // have something to show before any cloud/custom presets load.
   presets: [
     ...BUILTIN_PRESETS.map((p) => ({ ...p, bands: p.bands.map((b) => ({ ...b })) })),
     ...loadCustomPresets(),
   ],
-  currentPresetId: null,
+  currentPresetId: INITIAL_WORKING?.currentPresetId ?? null,
   dirty: false,
   bridgeReady: false,
   autoConnect: true,
   selected: 4,
-  masterOn: true,
+  masterOn: INITIAL_WORKING?.masterOn ?? true,
   accent: loadAccent(),
-  activeSlot: "A",
+  activeSlot: INITIAL_WORKING?.activeSlot ?? "A",
   slotStash: null,
 
   init: async () => {
@@ -228,30 +273,16 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
       .setTrayPresets(get().presets.map((p) => ({ id: p.id, name: p.name })))
       .catch(() => {});
 
-    // Auto-connect poller: while disconnected (and not manually disconnected),
-    // watch for an attached device and connect to it automatically. Also covers
-    // hot-plug — pull out the dongle and plug it back in and we reconnect.
-    let polling = false;
-    const poll = async () => {
-      if (polling) return; // skip overlapping ticks (connect can take a moment)
-      const s = get();
-      if (!s.autoConnect || s.status !== "disconnected") return;
-      polling = true;
-      try {
-        const devices = await bridge.hidListDevices();
-        // Re-check state after the await: user may have acted in the meantime.
-        if (devices.length > 0 && get().autoConnect && get().status === "disconnected") {
-          await get().connect();
-        }
-      } catch {
-        /* no device / enumeration error — try again next tick */
-      } finally {
-        polling = false;
-      }
-    };
-    const timer = setInterval(() => void poll(), 2000);
-    void poll(); // attempt immediately on startup
-    unlisteners.push(() => clearInterval(timer));
+    // Seed connection state from the backend: it owns the auto-connect / hot-plug
+    // lifecycle now (in Rust), so when this window is (re)created the device may
+    // already be connected. The 2s auto-connect poller lives in the Rust backend
+    // and keeps running even while no window exists.
+    try {
+      const snap = await bridge.hidStatus();
+      set({ status: snap.status, device: snap.device ?? null });
+    } catch {
+      /* backend not ready / not Tauri — leave defaults */
+    }
 
     set({ bridgeReady: true });
     return () => {
@@ -447,15 +478,23 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     try {
       // T02-family protocol: stream the full biquad program + commit.
       // (See src/features/eq/t02-protocol.ts — validated against the official app.)
-      const frames = buildProgram(eq.bands);
-      for (const frame of frames) {
+      const allFrames = [...buildProgram(eq.bands), preampFrame(eq.preamp)];
+      for (const frame of allFrames) {
         await bridge.hidSendRaw(T02_REPORT_ID, frame);
       }
-      // Pre-amp / pre-gain (separate immediate frame, no commit).
-      await bridge.hidSendRaw(T02_REPORT_ID, preampFrame(eq.preamp));
+      // Register the exact frames with the backend so its background poller can
+      // replay them after a hot-plug reconnect with no window open.
+      await bridge.hidSetProgram(T02_REPORT_ID, allFrames).catch(() => {});
     } finally {
       set({ status: "connected" });
     }
+    // Persist the working EQ so a reopened window matches what we just pushed.
+    persistWorking({
+      eq: s.eq,
+      masterOn: s.masterOn,
+      activeSlot: s.activeSlot,
+      currentPresetId: s.currentPresetId,
+    });
   },
 
   factoryReset: async () => {
@@ -467,6 +506,14 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
           bands: DEFAULT_EQ_STATE.bands.map((b) => ({ ...b })),
           preamp: DEFAULT_EQ_STATE.preamp,
         },
+        currentPresetId: null,
+      });
+      const r = get();
+      persistWorking({
+        eq: r.eq,
+        masterOn: r.masterOn,
+        activeSlot: r.activeSlot,
+        currentPresetId: r.currentPresetId,
       });
     } finally {
       set({ status: "connected" });
