@@ -47,8 +47,11 @@ function EmptyState({ label }: { label: string }) {
 
 /** A scrollable, fixed-height list body so the four tabs stay the same size. */
 function ListBody({ children }: { children: React.ReactNode }) {
+  // Radix's Viewport wraps children in a `display:table; min-width:100%` div that
+  // grows to content width — defeating `truncate`/`flex-1` and letting rows
+  // overflow the panel. Force that wrapper to `block` so rows constrain to width.
   return (
-    <ScrollArea className="h-[360px] pr-3">
+    <ScrollArea className="h-[360px] pr-3 [&_[data-slot=scroll-area-viewport]>div]:!block">
       <div className="flex flex-col gap-2">{children}</div>
     </ScrollArea>
   );
@@ -58,6 +61,8 @@ export function PresetPanel() {
   const { t } = useTranslation();
   const applyPreset = useEqStore((s) => s.applyPreset);
   const storePresets = useEqStore((s) => s.presets);
+  const renameCustom = useEqStore((s) => s.renameCustom);
+  const deleteCustom = useEqStore((s) => s.deleteCustom);
 
   // 自定义: locally-saved presets live in the store, tagged source "custom".
   const customPresets = useMemo(
@@ -76,6 +81,19 @@ export function PresetPanel() {
         name: presetLabel(preset, t),
       }),
     );
+  };
+
+  const handleRename = (preset: Preset, name: string) => {
+    if (renameCustom(preset.id, name)) {
+      toast.success(t(K.preset.toastRenamed, { defaultValue: "已重命名为「{{name}}」", name }));
+    }
+  };
+
+  const handleDelete = (preset: Preset) => {
+    const name = preset.name;
+    if (deleteCustom(preset.id)) {
+      toast.success(t(K.preset.toastDeleted, { defaultValue: "已删除「{{name}}」", name }));
+    }
   };
 
   const handleLike = (resource: CloudResource<CloudPreset[]>) => (preset: CloudPreset) => {
@@ -126,7 +144,13 @@ export function PresetPanel() {
                 />
               ) : (
                 customPresets.map((p) => (
-                  <PresetRow key={p.id} preset={p} onUse={handleUse} />
+                  <PresetRow
+                    key={p.id}
+                    preset={p}
+                    onUse={handleUse}
+                    onRename={handleRename}
+                    onDelete={handleDelete}
+                  />
                 ))
               )}
             </ListBody>

@@ -81,6 +81,12 @@ export interface EqStoreState {
   dirty: boolean;
   /** True once the native event bridge has been wired (see {@link init}). */
   bridgeReady: boolean;
+  /**
+   * When true, the background poller auto-connects to an attached device.
+   * Set false on a manual disconnect so we don't immediately reconnect;
+   * re-enabled on the next manual connect.
+   */
+  autoConnect: boolean;
 
   // --- Lifecycle ---
   /**
@@ -106,6 +112,10 @@ export interface EqStoreState {
    * Returns false when no custom preset is currently selected.
    */
   updateCustom: () => boolean;
+  /** Rename a custom preset by id. Returns false if not found / not custom. */
+  renameCustom: (id: string, name: string) => boolean;
+  /** Delete a custom preset by id. Returns false if not found / not custom. */
+  deleteCustom: (id: string) => boolean;
 
   // --- Device-touching actions (delegate to bridge) ---
   /** Connect to a device (auto-picks primary when vid/pid omitted). */
@@ -133,6 +143,7 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
   currentPresetId: null,
   dirty: false,
   bridgeReady: false,
+  autoConnect: true,
 
   init: async () => {
     if (!bridge.isTauri()) {
@@ -167,6 +178,31 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     await bridge
       .setTrayPresets(get().presets.map((p) => ({ id: p.id, name: p.name })))
       .catch(() => {});
+
+    // Auto-connect poller: while disconnected (and not manually disconnected),
+    // watch for an attached device and connect to it automatically. Also covers
+    // hot-plug — pull out the dongle and plug it back in and we reconnect.
+    let polling = false;
+    const poll = async () => {
+      if (polling) return; // skip overlapping ticks (connect can take a moment)
+      const s = get();
+      if (!s.autoConnect || s.status !== "disconnected") return;
+      polling = true;
+      try {
+        const devices = await bridge.hidListDevices();
+        // Re-check state after the await: user may have acted in the meantime.
+        if (devices.length > 0 && get().autoConnect && get().status === "disconnected") {
+          await get().connect();
+        }
+      } catch {
+        /* no device / enumeration error — try again next tick */
+      } finally {
+        polling = false;
+      }
+    };
+    const timer = setInterval(() => void poll(), 2000);
+    void poll(); // attempt immediately on startup
+    unlisteners.push(() => clearInterval(timer));
 
     set({ bridgeReady: true });
     return () => {
@@ -245,8 +281,41 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
     return true;
   },
 
+  renameCustom: (id, name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return false;
+    const { presets } = get();
+    const idx = presets.findIndex((p) => p.id === id && p.source === "custom");
+    if (idx < 0) return false;
+    const next = presets.map((p, i) => (i === idx ? { ...p, name: trimmed } : p));
+    set({ presets: next });
+    persistCustomPresets(next);
+    if (bridge.isTauri()) {
+      void bridge.setTrayPresets(next.map((p) => ({ id: p.id, name: p.name }))).catch(() => {});
+    }
+    return true;
+  },
+
+  deleteCustom: (id) => {
+    const { presets, currentPresetId } = get();
+    const target = presets.find((p) => p.id === id && p.source === "custom");
+    if (!target) return false;
+    const next = presets.filter((p) => p.id !== id);
+    set({
+      presets: next,
+      // Clear the selection if we just removed the active preset.
+      currentPresetId: currentPresetId === id ? null : currentPresetId,
+    });
+    persistCustomPresets(next);
+    if (bridge.isTauri()) {
+      void bridge.setTrayPresets(next.map((p) => ({ id: p.id, name: p.name }))).catch(() => {});
+    }
+    return true;
+  },
+
   connect: async (vid, pid) => {
-    set({ status: "connecting" });
+    // A (re)connect re-arms auto-connect for future hot-plug events.
+    set({ status: "connecting", autoConnect: true });
     try {
       const device = await bridge.hidConnect(vid, pid);
       set({ device, status: "connected" });
@@ -261,8 +330,9 @@ export const useEqStore = create<EqStoreState>((set, get) => ({
   },
 
   disconnect: async () => {
+    // Manual disconnect: stop the poller from immediately reconnecting.
     await bridge.hidDisconnect();
-    set({ device: null, status: "disconnected" });
+    set({ device: null, status: "disconnected", autoConnect: false });
     await bridge.setTrayStatus("disconnected");
   },
 

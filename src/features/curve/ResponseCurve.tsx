@@ -101,7 +101,10 @@ export function ResponseCurve({ eq, height = 220, dbRange = 12 }: ResponseCurveP
           ticks: { stroke: gridStroke, width: 1 },
           font: "11px ui-sans-serif, system-ui, sans-serif",
           splits: () => FREQ_TICKS,
-          values: (_u, splits) => splits.map((v) => fmtHz(v)),
+          // Show every tick we supply: uPlot's default log filter nulls out
+          // non-decade ticks (e.g. 20/50/200/500), which renders as "null".
+          filter: (_u, splits) => splits,
+          values: (_u, splits) => splits.map((v) => (v == null ? "" : fmtHz(v))),
         },
         {
           stroke: axisStroke,
