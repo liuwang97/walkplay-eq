@@ -1,5 +1,16 @@
 # Walkplay DAC HID Protocol (reverse-engineered)
 
+> **Read this first.** These are early notes on the *register* protocol of other
+> Walkplay chip families. The app does not implement any of it: the T02 speaks
+> the coefficient protocol described in `CAPTURE.md` and implemented in
+> `src/features/eq/t02-protocol.ts`. Two things below turned out to be wrong:
+>
+> - **Report 84 ("12345678") is not a connection handshake.** The official app
+>   sends it only to start a firmware upgrade, right before opening the device's
+>   serial port. Nothing needs to be sent before EQ commands.
+> - **VID 0x0666 / PID 0x0888 is not the "primary device".** It is the identity a
+>   device takes on while its firmware is being upgraded.
+
 Source of truth: the obfuscated web bundle `peq-bundle.js` (Vue3 + Element Plus),
 de-obfuscated to `peq-bundle.beauty.js`. Confidence tags:
 

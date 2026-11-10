@@ -5,3 +5,12 @@
 [workspace]
 resolver = "2"
 members = ["src-tauri", "crates/walkplay-dac-protocol"]
+
+# Size-first release build: a smaller executable loads faster and the app's own
+# code is nowhere near CPU-bound.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

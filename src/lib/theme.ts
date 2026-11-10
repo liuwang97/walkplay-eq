@@ -1,13 +1,12 @@
 /**
  * WalkPlay EQ — porcelain design system primitives.
  *
- * Ported from the Claude Design handoff (`design-ref/`). Centralizes the accent
- * palette, the instrument's log-frequency / dB geometry, and the preset
- * mini-curve thumbnail generator so every redesigned component shares one
- * source of truth. The DSP itself is reused from `@/features/curve/dsp`.
+ * Ported from the Claude Design handoff (`design-ref/`): the accent palette,
+ * the instrument's log-frequency / dB geometry, and the preset mini-curve
+ * thumbnail, so every component shares one source of truth.
  */
 
-import { computeMagnitudeResponse } from "@/features/curve/dsp";
+import { computeMagnitudeResponse, F_MAX, F_MIN, makeFreqAxis } from "@/features/curve/dsp";
 import type { EqState } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -16,14 +15,6 @@ import type { EqState } from "@/lib/types";
 
 export type AccentKey = "azure" | "violet" | "emerald" | "amber" | "graphite";
 
-export const ACCENT_KEYS: readonly AccentKey[] = [
-  "azure",
-  "violet",
-  "emerald",
-  "amber",
-  "graphite",
-];
-
 const ACCENT_BASE: Record<AccentKey, { a: string; d: string }> = {
   azure: { a: "#2f6bff", d: "#6a4cff" },
   violet: { a: "#6d5cff", d: "#a64cff" },
@@ -31,6 +22,8 @@ const ACCENT_BASE: Record<AccentKey, { a: string; d: string }> = {
   amber: { a: "#e08a2f", d: "#ef6a5b" },
   graphite: { a: "#465066", d: "#6b7488" },
 };
+
+export const ACCENT_KEYS = Object.keys(ACCENT_BASE) as AccentKey[];
 
 /** Resolve a hex color to an rgba() string with the given alpha. */
 export function hexA(hex: string, a: number): string {
@@ -50,7 +43,6 @@ export interface Palette {
   /** Accent at 45% alpha — colored shadows. */
   shadow: string;
   ink: string;
-  muted: string;
   cut: string;
 }
 
@@ -64,21 +56,9 @@ export function palette(accent: AccentKey): Palette {
     soft: hexA(p.a, 0.1),
     shadow: hexA(p.a, 0.45),
     ink: "#1b1f2e",
-    muted: "#8a90a3",
     cut: "#7c8398",
   };
 }
-
-// ---------------------------------------------------------------------------
-// Shared neutral porcelain tokens (for inline styles)
-// ---------------------------------------------------------------------------
-
-export const INK = "#1b1f2e";
-export const MUTED = "#8a90a3";
-export const CUT = "#7c8398";
-export const LINE = "rgba(28,32,58,0.08)";
-export const LINE_SOFT = "rgba(28,32,58,0.07)";
-export const HAIRLINE = "rgba(28,32,58,0.06)";
 
 // ---------------------------------------------------------------------------
 // Instrument geometry — log frequency axis (20 Hz .. 20 kHz) + dB axis
@@ -89,35 +69,27 @@ export const INSTR_W = 740;
 /** Internal SVG drawing height of the curve (viewBox units). */
 export const INSTR_H = 256;
 
-export const F_MIN = 20;
-export const F_MAX = 20000;
 const LF0 = Math.log10(F_MIN);
-const LFS = Math.log10(F_MAX) - Math.log10(F_MIN);
+const LFS = Math.log10(F_MAX) - LF0;
 
-/** Gain axis half-span (dB) the curve maps to ±(H/2). */
-export const GAIN_SPAN = 15;
-/** Per-band gain clamp (dB). */
-export const GAIN_MIN = -10;
-export const GAIN_MAX = 10;
-/** Preamp clamp (dB). */
-export const PREAMP_MIN = -16;
-export const PREAMP_MAX = 6;
+/** Gain axis half-span (dB) the curve maps to ±(H/2 − 22). */
+const GAIN_SPAN = 15;
 
 /** Frequency (Hz) -> x in [0, INSTR_W]. */
-export function freqToX(f: number, w = INSTR_W): number {
-  return ((Math.log10(f) - LF0) / LFS) * w;
+export function freqToX(f: number): number {
+  return ((Math.log10(f) - LF0) / LFS) * INSTR_W;
 }
 /** x in [0, INSTR_W] -> frequency (Hz). */
-export function xToFreq(x: number, w = INSTR_W): number {
-  return Math.pow(10, LF0 + (x / w) * LFS);
+export function xToFreq(x: number): number {
+  return Math.pow(10, LF0 + (x / INSTR_W) * LFS);
 }
 /** dB -> y in the curve viewBox (0 dB at vertical center). */
-export function dbToY(db: number, h = INSTR_H): number {
-  return h / 2 - (db / GAIN_SPAN) * (h / 2 - 22);
+export function dbToY(db: number): number {
+  return INSTR_H / 2 - (db / GAIN_SPAN) * (INSTR_H / 2 - 22);
 }
 /** y -> dB (inverse of {@link dbToY}). */
-export function yToDb(y: number, h = INSTR_H): number {
-  return ((h / 2 - y) / (h / 2 - 22)) * GAIN_SPAN;
+export function yToDb(y: number): number {
+  return ((INSTR_H / 2 - y) / (INSTR_H / 2 - 22)) * GAIN_SPAN;
 }
 
 /** Format a frequency for axis/label display (e.g. 1000 -> "1k", 1170 -> "1.2k"). */
@@ -142,22 +114,19 @@ export const round05 = (v: number) => Math.round(v * 2) / 2;
 // Preset mini-curve thumbnail (sidebar cards)
 // ---------------------------------------------------------------------------
 
+const THUMB_AXIS = makeFreqAxis(46);
+
 /**
- * Build an SVG path string for a preset's response, fitted to a `w`×`h` box
- * (default 108×34 to match the design cards). Uses the same biquad DSP as the
- * live curve so thumbnails are real, not faked.
+ * SVG path for a preset's response fitted to a `w`×`h` box. Uses the same
+ * biquad DSP as the live curve, so thumbnails are real, not faked.
  */
-export function thumbPath(eq: EqState, w = 108, h = 34, n = 46): string {
-  const freqs = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    freqs[i] = Math.pow(10, LF0 + (i / (n - 1)) * LFS);
-  }
-  const mags = computeMagnitudeResponse(eq, freqs);
-  const mid = h / 2;
+export function thumbPath(eq: EqState, w: number, h: number): string {
+  const mags = computeMagnitudeResponse(eq, THUMB_AXIS);
+  const last = THUMB_AXIS.length - 1;
   const pts: string[] = [];
-  for (let i = 0; i < n; i++) {
-    const x = (i / (n - 1)) * w;
-    const y = clamp(mid - (mags[i] / 10) * (h * 0.41), 2, h - 2);
+  for (let i = 0; i <= last; i++) {
+    const x = (i / last) * w;
+    const y = clamp(h / 2 - (mags[i] / 10) * (h * 0.41), 2, h - 2);
     pts.push((i ? "L" : "M") + x.toFixed(1) + " " + y.toFixed(1));
   }
   return pts.join(" ");

@@ -1,18 +1,31 @@
 /**
  * Global EQ store (Zustand) — the single source of truth for UI state.
  *
- * Local-state mutations are implemented now. Device-touching actions delegate to
- * the typed bridge wrappers (src/lib/bridge.ts), which invoke the Rust commands.
- * The HID-CORE agent fleshes out the Rust side; this contract stays stable.
+ * Every change to what the device should play goes through {@link scheduleSync},
+ * which persists the working EQ and hands the backend one complete program. The
+ * backend writes it when a device is connected and replays it on every
+ * (re)connect, so the store never has to care whether one is attached.
  */
 
 import { create } from "zustand";
+import i18n, { getLanguage } from "@/i18n";
+import {
+  buildFactoryReset,
+  buildProgram,
+  parseVersion,
+  READ_VERSION,
+  SAVE_TO_FLASH,
+  T02_REPORT_ID,
+  UNTAGGED,
+} from "@/features/eq/t02-protocol";
+import { BUILTIN_PRESETS, presetLabel } from "@/features/presets/builtins";
 import * as bridge from "./bridge";
-import { BUILTIN_PRESETS } from "@/features/presets/builtins";
-import { buildProgram, preampFrame, T02_REPORT_ID } from "@/features/eq/t02-protocol";
 import { ACCENT_KEYS, type AccentKey } from "./theme";
 import {
-  DEFAULT_EQ_STATE,
+  cloneEq,
+  DEFAULT_BANDS,
+  fitBands,
+  snapPreamp,
   type ConnStatus,
   type DeviceInfo,
   type EqBand,
@@ -22,44 +35,28 @@ import {
 
 /** localStorage key holding the user's locally-saved custom presets. */
 const CUSTOM_KEY = "walkplay.customPresets";
+/** One-time copy of the custom presets as saved by the 10-band editor. */
+const CUSTOM_BACKUP_KEY = "walkplay.customPresets.10band";
 /** localStorage key holding the user's chosen accent color. */
 const ACCENT_KEY = "walkplay.accent";
 /** localStorage key holding the live "working" EQ (survives window destroy). */
 const WORKING_KEY = "walkplay.working";
 
-/** The persisted working snapshot — restored when a closed window is reopened. */
+/** The persisted working state — restored when a closed window is reopened. */
 interface WorkingSnapshot {
   eq: EqState;
   masterOn: boolean;
-  activeSlot: "A" | "B";
   currentPresetId: string | null;
+  dirty: boolean;
 }
 
-function loadWorking(): WorkingSnapshot | null {
+function loadWorking(): Partial<WorkingSnapshot> {
   try {
-    const raw = localStorage.getItem(WORKING_KEY);
-    if (!raw) return null;
-    const w = JSON.parse(raw);
-    if (!w || !w.eq || !Array.isArray(w.eq.bands)) return null;
-    return w as WorkingSnapshot;
+    const w = JSON.parse(localStorage.getItem(WORKING_KEY) ?? "null");
+    if (!w || !Array.isArray(w.eq?.bands)) return {};
+    return { ...w, eq: { ...w.eq, bands: fitBands(w.eq.bands) } };
   } catch {
-    return null;
-  }
-}
-
-function persistWorking(s: WorkingSnapshot): void {
-  try {
-    localStorage.setItem(
-      WORKING_KEY,
-      JSON.stringify({
-        eq: s.eq,
-        masterOn: s.masterOn,
-        activeSlot: s.activeSlot,
-        currentPresetId: s.currentPresetId,
-      }),
-    );
-  } catch {
-    /* storage unavailable — non-fatal */
+    return {};
   }
 }
 
@@ -72,98 +69,58 @@ function loadAccent(): AccentKey {
   }
 }
 
-/** A flat (all gains 0, preamp 0) copy of an EQ — used for master-bypass push. */
-function flatten(eq: EqState): EqState {
-  return { bands: eq.bands.map((b) => ({ ...b, gain: 0 })), preamp: 0 };
-}
-
 function loadCustomPresets(): Preset[] {
   try {
-    const raw = localStorage.getItem(CUSTOM_KEY);
-    if (!raw) return [];
+    const raw = localStorage.getItem(CUSTOM_KEY) ?? "[]";
     const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? (arr as Preset[]).filter((p) => p && p.source === "custom") : [];
+    if (!Array.isArray(arr)) return [];
+    const presets = (arr as Preset[]).filter((p) => p?.source === "custom" && Array.isArray(p.bands));
+    // Presets saved by the 10-band editor lose their two unplayed bands below;
+    // keep the original once in case it is ever wanted back.
+    if (
+      presets.some((p) => p.bands.length > DEFAULT_BANDS.length) &&
+      localStorage.getItem(CUSTOM_BACKUP_KEY) === null
+    ) {
+      persist(CUSTOM_BACKUP_KEY, raw);
+    }
+    return presets.map((p) => ({ ...p, bands: fitBands(p.bands) }));
   } catch {
     return [];
   }
 }
 
-function persistCustomPresets(presets: Preset[]): void {
+/** Write a value to localStorage; storage being unavailable is non-fatal. */
+function persist(key: string, value: unknown): void {
   try {
-    localStorage.setItem(
-      CUSTOM_KEY,
-      JSON.stringify(presets.filter((p) => p.source === "custom")),
-    );
+    localStorage.setItem(key, typeof value === "string" ? value : JSON.stringify(value));
   } catch {
-    /* storage unavailable — non-fatal */
+    /* ignore */
   }
-}
-
-/**
- * Debounced full-program push. While dragging a slider we coalesce the rapid edits
- * into one device write (~60ms after the last change). The T02 device wants the FULL
- * 8-band program + commit on every change, so we always rebuild and stream it.
- */
-let pushTimer: ReturnType<typeof setTimeout> | null = null;
-function schedulePush(get: () => EqStoreState): void {
-  if (!bridge.isTauri()) return;
-  if (pushTimer) clearTimeout(pushTimer);
-  pushTimer = setTimeout(() => {
-    pushTimer = null;
-    const s = get();
-    if (s.status === "connected" || s.status === "busy") {
-      void s.pushToDevice().catch(() => {});
-    }
-  }, 60);
-}
-
-/**
- * Build the tray-preset payload: id + name + the precomputed T02 program frames.
- * The native tray needs the frames so it can apply a preset directly on the
- * device when no window is open (the WebView that normally builds them is gone).
- */
-function trayPayload(presets: Preset[]): bridge.TrayPreset[] {
-  return presets.map((p) => ({
-    id: p.id,
-    name: p.name,
-    reportId: T02_REPORT_ID,
-    frames: [...buildProgram(p.bands), preampFrame(p.preamp)],
-  }));
 }
 
 function newPresetId(): string {
-  try {
-    return "custom-" + crypto.randomUUID();
-  } catch {
-    return "custom-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-  }
+  return "custom-" + crypto.randomUUID();
 }
 
 export interface EqStoreState {
   device: DeviceInfo | null;
+  /** The connected device's firmware version, once it has answered. */
+  firmware: string | null;
   status: ConnStatus;
   eq: EqState;
   presets: Preset[];
-  /** Id of the most recently applied preset (drives selection + tray check). */
+  /** Id of the most recently applied preset (drives selection + tray tick). */
   currentPresetId: string | null;
   /** True when the live EQ has unsaved edits relative to the selected preset. */
   dirty: boolean;
-  /** True once the native event bridge has been wired (see {@link init}). */
-  bridgeReady: boolean;
-  /**
-   * When true, the background poller auto-connects to an attached device.
-   * Set false on a manual disconnect so we don't immediately reconnect;
-   * re-enabled on the next manual connect.
-   */
-  autoConnect: boolean;
-
-  // --- Redesign UI state (porcelain instrument) ---
   /** Index of the band selected in the instrument / inspector. */
   selected: number;
-  /** Master EQ on/off. When off, a flat program is pushed (device bypass). */
+  /** Master EQ on/off. When off, the device gets a flat program (bypass). */
   masterOn: boolean;
   /** Active accent color (persisted). */
   accent: AccentKey;
+  /** Whether the app launches at system startup (owned by the backend). */
+  autostart: boolean;
   /** A/B compare: which slot is live. */
   activeSlot: "A" | "B";
   /**
@@ -172,369 +129,344 @@ export interface EqStoreState {
    */
   slotStash: EqState | null;
 
-  // --- Lifecycle ---
   /**
-   * Subscribe to the native `conn-status` / `apply-preset` events and seed the
-   * tray "Quick EQ" submenu. Idempotent; safe to call once from app bootstrap.
-   * Returns a teardown fn that unsubscribes from the native events.
+   * Wire the store to the backend: follow connection changes and tray preset
+   * picks, publish the preset library to the tray, and catch up with whatever
+   * the backend did while no window existed. Returns a teardown function.
    */
   init: () => Promise<() => void>;
 
-  // --- Local-state mutations ---
-  /** Patch one band by id (partial). Updates local state only. */
+  /** Patch one band by id and apply it. */
   setBand: (id: number, patch: Partial<EqBand>) => void;
-  /** Set the global preamp (dB). Updates local state only. */
+  /** Set the global preamp (dB) and apply it. */
   setPreamp: (preamp: number) => void;
-  /** Replace the live EQ with a preset's bands/preamp. */
+  /** Replace the live EQ with a preset's bands/preamp and apply it. */
   applyPreset: (preset: Preset) => void;
-  /** Register the preset library and mirror it to the native tray. */
-  setPresets: (presets: Preset[]) => void;
-  /** Snapshot the live EQ into a new local custom preset. Returns its id. */
-  saveAsCustom: (name?: string) => string;
+  /** Restore the default EQ (all bands, types and frequencies) and re-enable it. */
+  resetToDefault: () => void;
+  /** Snapshot the live EQ into a new local custom preset. */
+  saveAsCustom: () => void;
   /**
    * Overwrite the currently-selected custom preset with the live EQ.
    * Returns false when no custom preset is currently selected.
    */
   updateCustom: () => boolean;
-  /** Rename a custom preset by id. Returns false if not found / not custom. */
-  renameCustom: (id: string, name: string) => boolean;
-  /** Delete a custom preset by id. Returns false if not found / not custom. */
-  deleteCustom: (id: string) => boolean;
+  /** Rename a custom preset by id. */
+  renameCustom: (id: string, name: string) => void;
+  /** Delete a custom preset by id. */
+  deleteCustom: (id: string) => void;
 
-  // --- Redesign UI actions ---
   /** Select a band (instrument node / fader / inspector focus). */
   setSelected: (i: number) => void;
-  /** Toggle master EQ on/off (off pushes a flat program to the device). */
+  /** Toggle master EQ on/off. */
   toggleMaster: () => void;
   /** Set the accent color (persisted). */
   setAccent: (accent: AccentKey) => void;
+  /** Turn launch-at-startup on or off. */
+  setAutostart: (enabled: boolean) => Promise<void>;
   /** Switch the live A/B slot, stashing the current one. */
   setActiveSlot: (slot: "A" | "B") => void;
   /** Copy the live EQ into the other A/B slot. */
   copyToOtherSlot: () => void;
 
-  // --- Device-touching actions (delegate to bridge) ---
-  /** Connect to a device (auto-picks primary when vid/pid omitted). */
-  connect: (vid?: number, pid?: number) => Promise<void>;
-  /** Disconnect the current device. */
+  /** Connect to a device. Rejects when none could be opened. */
+  connect: () => Promise<void>;
+  /** Disconnect; the backend stays disconnected until the next connect. */
   disconnect: () => Promise<void>;
-  /** Pull the full EQ from the device into the store. */
-  loadFromDevice: () => Promise<void>;
-  /** Push the entire current EQ (all bands + preamp) to the device. */
-  pushToDevice: () => Promise<void>;
-  /** Factory-reset the device, then reload local state to defaults. */
-  factoryReset: () => Promise<void>;
 }
 
-/** Working EQ restored at module load (used to seed the store's initial state). */
-const INITIAL_WORKING = loadWorking();
+type Get = () => EqStoreState;
 
-export const useEqStore = create<EqStoreState>((set, get) => ({
-  device: null,
-  status: "disconnected",
-  // Restore the last working EQ so a reopened (recreated) window matches the
-  // EQ the backend replayed to the device. Falls back to a flat default.
-  eq: INITIAL_WORKING?.eq
-    ? { bands: INITIAL_WORKING.eq.bands.map((b) => ({ ...b })), preamp: INITIAL_WORKING.eq.preamp }
-    : { bands: DEFAULT_EQ_STATE.bands.map((b) => ({ ...b })), preamp: DEFAULT_EQ_STATE.preamp },
-  // Seed the library with the built-in presets so both the panel and the tray
-  // have something to show before any cloud/custom presets load.
-  presets: [
-    ...BUILTIN_PRESETS.map((p) => ({ ...p, bands: p.bands.map((b) => ({ ...b })) })),
-    ...loadCustomPresets(),
-  ],
-  currentPresetId: INITIAL_WORKING?.currentPresetId ?? null,
-  dirty: false,
-  bridgeReady: false,
-  autoConnect: true,
-  selected: 4,
-  masterOn: INITIAL_WORKING?.masterOn ?? true,
-  accent: loadAccent(),
-  activeSlot: INITIAL_WORKING?.activeSlot ?? "A",
-  slotStash: null,
+// ---------------------------------------------------------------------------
+// Device sync
+// ---------------------------------------------------------------------------
 
-  init: async () => {
-    if (!bridge.isTauri()) {
-      // Plain-browser preview: nothing native to wire. Mark ready anyway so the
-      // UI doesn't keep retrying.
-      set({ bridgeReady: true });
-      return () => {};
-    }
+let syncTimer: ReturnType<typeof setTimeout> | undefined;
+let syncing = false;
+let syncAgain = false;
 
-    const unlisteners: Array<() => void> = [];
+/** The next send should also make the device keep the EQ across power loss. */
+let saveNext = false;
 
-    // Native connection-status transitions (connect/disconnect/handshake).
-    unlisteners.push(
-      await bridge.onConnStatus((status) => {
-        set((s) => ({
-          status,
-          device:
-            status === "disconnected" ? null : s.device,
-        }));
-      }),
-    );
+/**
+ * Persist the working EQ and send it to the backend. Coalesces bursts (a slider
+ * drag fires on every pointer move) into one send ~50ms after the last change.
+ *
+ * `save` marks an EQ the user chose to keep — a preset applied, a custom EQ
+ * saved — as opposed to an edit in progress, which only plays. It is the
+ * official app's "use" versus "try".
+ */
+function scheduleSync(get: Get, save = false): void {
+  if (save) saveNext = true;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => void sync(get), 50);
+}
 
-    // Tray "Quick EQ" selection -> apply the matching preset locally + push.
-    unlisteners.push(
-      await bridge.onApplyPresetFromTray((presetId) => {
-        const preset = get().presets.find((p) => p.id === presetId);
-        if (preset) void get().applyPreset(preset);
-      }),
-    );
+async function sync(get: Get): Promise<void> {
+  // One send at a time, always ending on the latest state, so programs can
+  // never reach the device out of order.
+  if (syncing) {
+    syncAgain = true;
+    return;
+  }
+  syncing = true;
+  try {
+    do {
+      syncAgain = false;
+      const { eq, masterOn, currentPresetId, dirty, presets } = get();
+      persist(WORKING_KEY, { eq, masterOn, currentPresetId, dirty } satisfies WorkingSnapshot);
+      if (!bridge.isTauri()) continue;
+      // Master off = device bypass: a flat program instead of the live EQ.
+      const audible: EqState = masterOn
+        ? eq
+        : { bands: eq.bands.map((b) => ({ ...b, gain: 0 })), preamp: 0 };
+      const presetId = masterOn && !dirty ? currentPresetId : null;
+      const tag = presets.find((p) => p.id === presetId)?.tag ?? UNTAGGED;
+      // The bypass is never worth keeping on the device.
+      const saveFrames = saveNext && masterOn ? [SAVE_TO_FLASH] : [];
+      saveNext = false;
+      // A failed write means the device went away; the backend reports that
+      // through `conn-status` and replays this program when it is back.
+      await bridge
+        .hidApplyProgram(T02_REPORT_ID, buildProgram(audible, tag), saveFrames, presetId)
+        .catch(() => {});
+    } while (syncAgain);
+  } finally {
+    syncing = false;
+  }
+}
 
-    // Seed the tray submenu with the current preset library.
-    await bridge
-      .setTrayPresets(trayPayload(get().presets))
-      .catch(() => {});
+/** Publish the preset library (names in the UI language) to the native tray. */
+function syncTray(presets: Preset[]): void {
+  if (!bridge.isTauri()) return;
+  const lang = getLanguage();
+  const entries = presets.map((p) => ({
+    id: p.id,
+    name: presetLabel(p, lang),
+    reportId: T02_REPORT_ID,
+    frames: buildProgram(p, p.tag ?? UNTAGGED),
+    // Picking a preset from the tray means "use this", so the device keeps it.
+    saveFrames: [SAVE_TO_FLASH],
+  }));
+  void bridge.traySync(lang, entries).catch(() => {});
+}
 
-    // Seed connection state from the backend: it owns the auto-connect / hot-plug
-    // lifecycle now (in Rust), so when this window is (re)created the device may
-    // already be connected. The 2s auto-connect poller lives in the Rust backend
-    // and keeps running even while no window exists.
-    try {
-      const snap = await bridge.hidStatus();
-      set({ status: snap.status, device: snap.device ?? null });
-    } catch {
-      /* backend not ready / not Tauri — leave defaults */
-    }
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
 
-    set({ bridgeReady: true });
-    return () => {
-      for (const u of unlisteners) u();
-    };
-  },
+const WORKING = loadWorking();
 
-  setBand: (id, patch) => {
+export const useEqStore = create<EqStoreState>((set, get) => {
+  /** Replace the custom-preset part of the library, persisting + republishing it. */
+  const commitPresets = (presets: Preset[], extra: Partial<EqStoreState> = {}) => {
+    set({ presets, ...extra });
+    persist(CUSTOM_KEY, presets.filter((p) => p.source === "custom"));
+    syncTray(presets);
+  };
+
+  /** Ask the connected device for its firmware version. */
+  const readFirmware = async () => {
+    const reply = await bridge.hidQuery(T02_REPORT_ID, READ_VERSION).catch(() => null);
+    set({ firmware: reply && parseVersion(reply) });
+  };
+
+  /** Pull connection status, device and settings from the backend. */
+  const refreshConnection = async () => {
+    const snap = await bridge.snapshot();
+    set({ status: snap.status, device: snap.device, autostart: snap.autostart });
+    if (snap.status === "connected") void readFirmware();
+    else set({ firmware: null });
+    return snap;
+  };
+
+  /** Make a preset the live EQ in the editor (the caller sends it). */
+  const showPreset = (preset: Preset) => {
     set((s) => ({
-      // A manual edit marks the EQ dirty but keeps the selected preset so
-      // "更新自定义EQ" can write the tweaks back to it.
-      dirty: true,
-      eq: {
-        ...s.eq,
-        bands: s.eq.bands.map((b) => (b.id === id ? { ...b, ...patch } : b)),
-      },
-    }));
-    schedulePush(get); // live-apply the edit to the device
-  },
-
-  setPreamp: (preamp) => {
-    set((s) => ({ dirty: true, eq: { ...s.eq, preamp } }));
-    schedulePush(get);
-  },
-
-  applyPreset: (preset) => {
-    set(() => ({
       currentPresetId: preset.id,
       dirty: false,
-      eq: { bands: preset.bands.map((b) => ({ ...b })), preamp: preset.preamp },
+      eq: cloneEq(preset),
+      // Presets differ in band count; keep the selection on a real band.
+      selected: Math.min(s.selected, preset.bands.length - 1),
     }));
-    // If connected, applying a preset should also reach the hardware.
-    if (get().status === "connected") {
-      void get().pushToDevice().catch(() => {});
+  };
+
+  /** Show a preset the tray already put on the device. */
+  const adoptTrayPreset = (presetId: string) => {
+    const preset = get().presets.find((p) => p.id === presetId);
+    if (preset) {
+      // Picking a preset from the tray means "play this", so leave bypass.
+      set({ masterOn: true });
+      showPreset(preset);
     }
-  },
+    // The tray has already had the device keep it; this send only tells the
+    // backend that a window now shows it.
+    scheduleSync(get);
+  };
 
-  setPresets: (presets) => {
-    set({ presets });
-    if (bridge.isTauri()) {
-      void bridge
-        .setTrayPresets(trayPayload(presets))
-        .catch(() => {});
-    }
-  },
+  return {
+    device: null,
+    firmware: null,
+    status: "disconnected",
+    eq: cloneEq(WORKING.eq ?? { bands: DEFAULT_BANDS, preamp: 0 }),
+    presets: [...BUILTIN_PRESETS.map((p) => ({ ...p, ...cloneEq(p) })), ...loadCustomPresets()],
+    currentPresetId: WORKING.currentPresetId ?? null,
+    dirty: WORKING.dirty ?? false,
+    selected: 3,
+    masterOn: WORKING.masterOn ?? true,
+    accent: loadAccent(),
+    autostart: false,
+    activeSlot: "A",
+    slotStash: null,
 
-  saveAsCustom: (name) => {
-    const { eq, presets } = get();
-    const id = newPresetId();
-    const customCount = presets.filter((p) => p.source === "custom").length;
-    const preset: Preset = {
-      id,
-      name: name && name.trim() ? name.trim() : `自定义 EQ ${customCount + 1}`,
-      bands: eq.bands.map((b) => ({ ...b })),
-      preamp: eq.preamp,
-      source: "custom",
-    };
-    const next = [...presets, preset];
-    set({ presets: next, currentPresetId: id, dirty: false });
-    persistCustomPresets(next);
-    if (bridge.isTauri()) {
-      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
-    }
-    return id;
-  },
+    init: async () => {
+      if (!bridge.isTauri()) return () => {};
 
-  updateCustom: () => {
-    const { eq, presets, currentPresetId } = get();
-    const idx = presets.findIndex((p) => p.id === currentPresetId && p.source === "custom");
-    if (idx < 0) return false;
-    const next = presets.map((p, i) =>
-      i === idx ? { ...p, bands: eq.bands.map((b) => ({ ...b })), preamp: eq.preamp } : p,
-    );
-    set({ presets: next, dirty: false });
-    persistCustomPresets(next);
-    // Refresh the tray frames so a tray apply uses the updated EQ.
-    if (bridge.isTauri()) {
-      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
-    }
-    return true;
-  },
+      const unlisten = await Promise.all([
+        bridge.onConnStatus(() => void refreshConnection().catch(() => {})),
+        bridge.onApplyPresetFromTray(adoptTrayPreset),
+      ]);
+      // Tray labels follow the UI language.
+      const onLanguage = () => syncTray(get().presets);
+      i18n.on("languageChanged", onLanguage);
+      syncTray(get().presets);
 
-  renameCustom: (id, name) => {
-    const trimmed = name.trim();
-    if (!trimmed) return false;
-    const { presets } = get();
-    const idx = presets.findIndex((p) => p.id === id && p.source === "custom");
-    if (idx < 0) return false;
-    const next = presets.map((p, i) => (i === idx ? { ...p, name: trimmed } : p));
-    set({ presets: next });
-    persistCustomPresets(next);
-    if (bridge.isTauri()) {
-      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
-    }
-    return true;
-  },
-
-  deleteCustom: (id) => {
-    const { presets, currentPresetId } = get();
-    const target = presets.find((p) => p.id === id && p.source === "custom");
-    if (!target) return false;
-    const next = presets.filter((p) => p.id !== id);
-    set({
-      presets: next,
-      // Clear the selection if we just removed the active preset.
-      currentPresetId: currentPresetId === id ? null : currentPresetId,
-    });
-    persistCustomPresets(next);
-    if (bridge.isTauri()) {
-      void bridge.setTrayPresets(trayPayload(next)).catch(() => {});
-    }
-    return true;
-  },
-
-  setSelected: (i) => set({ selected: i }),
-
-  toggleMaster: () => {
-    set((s) => ({ masterOn: !s.masterOn }));
-    // Re-push so the device reflects bypass / re-engage immediately.
-    if (get().status === "connected" || get().status === "busy") {
-      void get().pushToDevice().catch(() => {});
-    }
-  },
-
-  setAccent: (accent) => {
-    set({ accent });
-    try {
-      localStorage.setItem(ACCENT_KEY, accent);
-    } catch {
-      /* storage unavailable — non-fatal */
-    }
-  },
-
-  setActiveSlot: (slot) => {
-    const s = get();
-    if (slot === s.activeSlot) return;
-    // Swap the live EQ with the stash; seed B from A the first time.
-    const incoming = s.slotStash ?? {
-      bands: s.eq.bands.map((b) => ({ ...b })),
-      preamp: s.eq.preamp,
-    };
-    set({
-      activeSlot: slot,
-      slotStash: { bands: s.eq.bands.map((b) => ({ ...b })), preamp: s.eq.preamp },
-      eq: { bands: incoming.bands.map((b) => ({ ...b })), preamp: incoming.preamp },
-      currentPresetId: null,
-      dirty: false,
-    });
-    schedulePush(get);
-  },
-
-  copyToOtherSlot: () => {
-    const s = get();
-    set({ slotStash: { bands: s.eq.bands.map((b) => ({ ...b })), preamp: s.eq.preamp } });
-  },
-
-  connect: async (vid, pid) => {
-    // A (re)connect re-arms auto-connect for future hot-plug events.
-    set({ status: "connecting", autoConnect: true });
-    try {
-      const device = await bridge.hidConnect(vid, pid);
-      set({ device, status: "connected" });
-      await bridge.setTrayStatus("connected");
-      // Readback is blocked on Windows for this device, so push our current EQ to
-      // establish a known state (UI == device).
-      await get().pushToDevice().catch(() => {});
-    } catch (err) {
-      set({ status: "disconnected", device: null });
-      throw err;
-    }
-  },
-
-  disconnect: async () => {
-    // Manual disconnect: stop the poller from immediately reconnecting.
-    await bridge.hidDisconnect();
-    set({ device: null, status: "disconnected", autoConnect: false });
-    await bridge.setTrayStatus("disconnected");
-  },
-
-  loadFromDevice: async () => {
-    set({ status: "busy" });
-    try {
-      const eq: EqState = await bridge.hidReadEq();
-      set({ eq, status: "connected" });
-    } catch (err) {
-      set({ status: "connected" });
-      throw err;
-    }
-  },
-
-  pushToDevice: async () => {
-    if (!bridge.isTauri()) return;
-    const s = get();
-    // Master off = device bypass: stream a flat program instead of the live EQ.
-    const eq = s.masterOn ? s.eq : flatten(s.eq);
-    set({ status: "busy" });
-    try {
-      // T02-family protocol: stream the full biquad program + commit.
-      // (See src/features/eq/t02-protocol.ts — validated against the official app.)
-      const allFrames = [...buildProgram(eq.bands), preampFrame(eq.preamp)];
-      for (const frame of allFrames) {
-        await bridge.hidSendRaw(T02_REPORT_ID, frame);
+      try {
+        const snap = await refreshConnection();
+        if (snap.pendingPreset) adoptTrayPreset(snap.pendingPreset);
+        // Give the backend the EQ this window shows. On a first run it has
+        // none; otherwise this replaces a program an older build encoded.
+        else scheduleSync(get);
+      } catch {
+        /* backend unavailable — stay on defaults */
       }
-      // Register the exact frames with the backend so its background poller can
-      // replay them after a hot-plug reconnect with no window open.
-      await bridge.hidSetProgram(T02_REPORT_ID, allFrames).catch(() => {});
-    } finally {
-      set({ status: "connected" });
-    }
-    // Persist the working EQ so a reopened window matches what we just pushed.
-    persistWorking({
-      eq: s.eq,
-      masterOn: s.masterOn,
-      activeSlot: s.activeSlot,
-      currentPresetId: s.currentPresetId,
-    });
-  },
 
-  factoryReset: async () => {
-    set({ status: "busy" });
-    try {
-      await bridge.hidFactoryReset();
+      return () => {
+        for (const u of unlisten) u();
+        i18n.off("languageChanged", onLanguage);
+      };
+    },
+
+    setBand: (id, patch) => {
+      // An edit marks the EQ dirty but keeps the selected preset, so "update
+      // custom EQ" can write the tweaks back to it.
+      set((s) => ({
+        dirty: true,
+        eq: { ...s.eq, bands: s.eq.bands.map((b) => (b.id === id ? { ...b, ...patch } : b)) },
+      }));
+      scheduleSync(get);
+    },
+
+    setPreamp: (preamp) => {
+      set((s) => ({ dirty: true, eq: { ...s.eq, preamp: snapPreamp(preamp) } }));
+      scheduleSync(get);
+    },
+
+    applyPreset: (preset) => {
+      showPreset(preset);
+      scheduleSync(get, true);
+    },
+
+    resetToDefault: () => {
+      set({ masterOn: true });
+      showPreset(BUILTIN_PRESETS[0]);
+      if (!bridge.isTauri()) return scheduleSync(get);
+      // The device's own factory reset saves the flat EQ itself, so the program
+      // that follows only plays. With no device to reset, have the flat EQ
+      // saved on the next connect instead.
+      void bridge.hidSend(T02_REPORT_ID, buildFactoryReset()).then(
+        () => scheduleSync(get),
+        () => scheduleSync(get, true),
+      );
+    },
+
+    saveAsCustom: () => {
+      const { eq, presets } = get();
+      const id = newPresetId();
+      const n = presets.filter((p) => p.source === "custom").length + 1;
+      const name = getLanguage() === "en" ? `Custom EQ ${n}` : `自定义 EQ ${n}`;
+      commitPresets([...presets, { id, name, ...cloneEq(eq), source: "custom" }], {
+        currentPresetId: id,
+        dirty: false,
+      });
+      scheduleSync(get, true);
+    },
+
+    updateCustom: () => {
+      const { eq, presets, currentPresetId } = get();
+      if (!presets.some((p) => p.id === currentPresetId && p.source === "custom")) return false;
+      commitPresets(
+        presets.map((p) => (p.id === currentPresetId ? { ...p, ...cloneEq(eq) } : p)),
+        { dirty: false },
+      );
+      scheduleSync(get, true);
+      return true;
+    },
+
+    renameCustom: (id, name) => {
+      commitPresets(
+        get().presets.map((p) => (p.id === id && p.source === "custom" ? { ...p, name } : p)),
+      );
+    },
+
+    deleteCustom: (id) => {
+      const { presets, currentPresetId } = get();
+      commitPresets(
+        presets.filter((p) => !(p.id === id && p.source === "custom")),
+        // Clear the selection if we just removed the active preset.
+        currentPresetId === id ? { currentPresetId: null } : {},
+      );
+      scheduleSync(get);
+    },
+
+    setSelected: (i) => set({ selected: i }),
+
+    toggleMaster: () => {
+      set((s) => ({ masterOn: !s.masterOn }));
+      scheduleSync(get);
+    },
+
+    setAccent: (accent) => {
+      set({ accent });
+      persist(ACCENT_KEY, accent);
+    },
+
+    setAutostart: async (enabled) => {
+      set({ autostart: await bridge.setAutostart(enabled) });
+    },
+
+    setActiveSlot: (slot) => {
+      const s = get();
+      if (slot === s.activeSlot) return;
+      // Swap the live EQ with the stash; B starts as a copy of A.
       set({
-        eq: {
-          bands: DEFAULT_EQ_STATE.bands.map((b) => ({ ...b })),
-          preamp: DEFAULT_EQ_STATE.preamp,
-        },
+        activeSlot: slot,
+        slotStash: cloneEq(s.eq),
+        eq: cloneEq(s.slotStash ?? s.eq),
         currentPresetId: null,
+        dirty: false,
       });
-      const r = get();
-      persistWorking({
-        eq: r.eq,
-        masterOn: r.masterOn,
-        activeSlot: r.activeSlot,
-        currentPresetId: r.currentPresetId,
-      });
-    } finally {
-      set({ status: "connected" });
-    }
-  },
-}));
+      scheduleSync(get);
+    },
+
+    copyToOtherSlot: () => set((s) => ({ slotStash: cloneEq(s.eq) })),
+
+    connect: async () => {
+      set({ status: "connecting" });
+      try {
+        // The backend replays the current program on the freshly opened device.
+        const device = await bridge.hidConnect();
+        set({ device, status: "connected" });
+        void readFirmware();
+      } catch (err) {
+        set({ status: "disconnected", device: null });
+        throw err;
+      }
+    },
+
+    disconnect: async () => {
+      await bridge.hidDisconnect();
+      set({ device: null, firmware: null, status: "disconnected" });
+    },
+  };
+});

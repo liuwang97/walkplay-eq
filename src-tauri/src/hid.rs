@@ -1,223 +1,127 @@
 //! Native HID connection layer.
 //!
-//! Owns the SINGLE native HID device handle for the whole process. The WebView
-//! never touches hardware directly — it calls these `tauri::command`s.
+//! Owns the SINGLE native HID handle for the whole process; the WebView never
+//! touches hardware directly. The handle lives behind a process-wide `Mutex`
+//! ([`HidState`]) so every command, the tray and the background poller share
+//! one connection. The lock is never held across an `.await` or a Tauri call.
 //!
-//! Implemented by the HID-CORE agent: `hidapi` is the primary transport. All
-//! byte-level framing is delegated to the `walkplay-dac-protocol` crate so we
-//! never hand-roll wire bytes here.
+//! The device is driven with whole *programs*: the complete list of output
+//! report frames for one EQ state (see `src/features/eq/t02-protocol.ts`, which
+//! builds them). The last program is cached, persisted and replayed after every
+//! (re)connect, so the EQ survives hot-plug and reboots with no window open.
 //!
-//! # Threading model
-//!
-//! The one open [`hidapi::HidDevice`] lives behind a process-wide `Mutex`
-//! ([`HidState`]) registered as Tauri managed state, so every command shares the
-//! same single connection. `HidDevice` is `Send` (hidapi marks it so) which lets
-//! it sit in the `Mutex`. We never hold the lock across an `.await`, so the
-//! commands stay sound on the async runtime.
-//!
-//! We deliberately do NOT keep a long-lived `HidApi` in the manager: a fresh
-//! `HidApi::new()` is cheap enough for our enumerate/connect paths and avoids
-//! pinning a (potentially non-`Sync`) enumeration context in shared state.
-//!
-//! # Verification status
-//!
-//! * Enumeration, connect/handshake, band/preamp/reset **writes** use byte
-//!   layouts marked `// VERIFIED` in the protocol crate (lifted from the
-//!   original web bundle). They are protocol-correct but still
-//!   `// NEEDS HARDWARE` for end-to-end confirmation.
-//! * EQ **read-back** (`hid_read_eq`) is `// INFERRED` — the bundle's primary
-//!   class ships an empty readback handler, so the device response shape is not
-//!   proven. We attempt a real feature/input read and fall back to a cached
-//!   best-effort snapshot. Marked `// NEEDS HARDWARE`.
+//! A program plays from the device's RAM. One the user has chosen to keep also
+//! carries *save frames*, sent once a moment later, which make the device hold
+//! it across power loss — so it still plays on a phone, with no app around.
 
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use walkplay_dac_protocol as proto;
 
-/// Event name emitted on every connection-status transition. The tray and the
-/// React UI both subscribe to this.
+/// Event emitted on every connection-status transition (payload: [`ConnStatus`]).
 pub const CONN_STATUS_EVENT: &str = "conn-status";
 
-/// Connection status mirrored to the UI store (`ConnStatus` in TS).
+/// How long the poller waits after a failed auto-connect before retrying, so a
+/// device we cannot open does not get hammered every tick.
+const RETRY_BACKOFF: Duration = Duration::from_secs(10);
+
+/// The report every EQ command and reply travels on.
+const COMMAND_REPORT: u8 = 75;
+
+/// The query a device must answer before it is given a program: "what is your
+/// firmware version?" in the T02 protocol. The vendor ids are shared by chip
+/// families that speak other protocols (the official app tells them apart
+/// through its cloud catalogue); those do not answer this, and must not be
+/// sent T02 frames.
+const PROBE: [u8; 2] = [0x80, 0x0c];
+
+/// How long after a program its save frames follow. The official app waits
+/// this long too, so the program has settled before the device writes flash.
+const SAVE_DELAY: Duration = Duration::from_secs(1);
+
+/// Connection status as seen by the tray and the UI (`ConnStatus` in TS, which
+/// additionally has a UI-only "connecting").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnStatus {
     #[default]
     Disconnected,
-    Connecting,
     Connected,
-    /// Set by the UI/tray during long operations (e.g. firmware flash). Not
-    /// constructed inside this module; kept as part of the declared API surface.
-    #[allow(dead_code)]
-    Busy,
 }
 
-/// A discovered device candidate (`DeviceInfo` in TS).
+/// The open (or a discovered) device (`DeviceInfo` in TS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub vid: u16,
     pub pid: u16,
     pub name: String,
-    pub connected: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub firmware: Option<String>,
 }
 
-/// One EQ band as exchanged with the UI (`EqBand` in TS).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EqBand {
-    pub id: u32,
-    pub freq: f32,
-    pub q: f32,
-    pub gain: f32,
-    /// "PK" | "LS" | "HS" (also accepts "LP" | "HP").
-    #[serde(rename = "type")]
-    pub band_type: String,
-    pub enabled: bool,
+/// One complete device program: every frame goes out on `report_id`, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Program {
+    pub report_id: u8,
+    pub frames: Vec<Vec<u8>>,
+    /// Frames that make the device keep this program across power loss. Sent
+    /// once, [`SAVE_DELAY`] after the program, and never part of a replay.
+    /// Empty for a program that is only being tried out.
+    #[serde(default)]
+    pub save_frames: Vec<Vec<u8>>,
 }
 
-/// Full EQ snapshot (`EqState` in TS).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EqState {
-    pub bands: Vec<EqBand>,
-    pub preamp: f32,
-}
-
-impl Default for EqState {
-    fn default() -> Self {
-        // Flat 10-band default mirroring the web app's initial program.
-        let default_freqs = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
-        let bands = (0..proto::NUM_BANDS)
-            .map(|i| EqBand {
-                id: i as u32,
-                freq: default_freqs[i],
-                q: 1.41,
-                gain: 0.0,
-                band_type: "PK".to_string(),
-                enabled: true,
-            })
-            .collect();
-        EqState { bands, preamp: 0.0 }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// UI <-> protocol band mapping
-// ---------------------------------------------------------------------------
-
-/// Map the UI band-type string ("PK"|"LS"|"HS"|"LP"|"HP") to a protocol filter.
-fn ui_type_to_filter(s: &str) -> proto::FilterType {
-    match s.to_ascii_uppercase().as_str() {
-        "LS" => proto::FilterType::LowShelf,
-        "HS" => proto::FilterType::HighShelf,
-        "LP" => proto::FilterType::LowPass,
-        "HP" => proto::FilterType::HighPass,
-        // "PK" and anything unrecognised collapse to peaking.
-        _ => proto::FilterType::Peaking,
-    }
-}
-
-/// Map a protocol filter back to the UI band-type string.
-fn filter_to_ui_type(f: proto::FilterType) -> &'static str {
-    match f {
-        proto::FilterType::Peaking => "PK",
-        proto::FilterType::LowShelf => "LS",
-        proto::FilterType::HighShelf => "HS",
-        proto::FilterType::LowPass => "LP",
-        proto::FilterType::HighPass => "HP",
-    }
-}
-
-/// Convert a UI band into the protocol wire band.
-///
-/// Disabled bands are flattened to 0 dB / Peaking, mirroring the web app (the
-/// primary register protocol carries no per-band enable bit — see the protocol
-/// crate docs on [`proto::encode_band`]).
-fn ui_band_to_wire(b: &EqBand) -> proto::EqBandWire {
-    if b.enabled {
-        proto::EqBandWire {
-            index: b.id as u8,
-            freq: b.freq,
-            q: b.q,
-            gain: b.gain,
-            filter: ui_type_to_filter(&b.band_type),
-            enabled: true,
-        }
-    } else {
-        proto::EqBandWire {
-            index: b.id as u8,
-            freq: b.freq,
-            q: b.q,
-            gain: 0.0,
-            filter: proto::FilterType::Peaking,
-            enabled: false,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Manager
-// ---------------------------------------------------------------------------
-
-/// Process-wide HID manager. Holds the one open handle + current status.
-///
-/// Wrapped in a `Mutex` and registered as Tauri managed state so every command
-/// shares the same single connection.
+/// Process-wide HID manager: the one open handle plus what to replay on it.
 pub struct HidManager {
-    pub status: ConnStatus,
-    pub device: Option<DeviceInfo>,
-    /// The single live native HID handle. `hidapi::HidDevice` is `Send`.
-    pub hid: Option<hidapi::HidDevice>,
-    /// Codec carrying the EQ base address for the connected device variant.
-    pub codec: Option<proto::Codec>,
-    /// Last EQ state we successfully wrote/read. Used as the best-effort
-    /// fallback for `hid_read_eq` until hardware confirms the readback shape.
-    pub cached_eq: Option<EqState>,
-    /// Timestamp of the last successful device I/O (keep-alive bookkeeping).
-    pub last_io: Option<Instant>,
-    /// Whether the background poller should auto-connect on device presence.
-    /// Set `false` by an explicit user disconnect, re-armed on any connect.
-    pub auto_connect: bool,
-    /// The last full program the UI pushed: a list of `(report_id, payload)`
-    /// frames. Replayed verbatim after a background hot-plug reconnect so the
-    /// user's EQ survives unplug/replug even with no window open.
-    pub program: Vec<(u8, Vec<u8>)>,
+    device: Option<DeviceInfo>,
+    hid: Option<hidapi::HidDevice>,
+    /// Whether the poller may connect on its own. Cleared by an explicit user
+    /// disconnect, re-armed by an explicit connect.
+    auto_connect: bool,
+    /// Earliest time the poller may try to auto-connect again.
+    retry_at: Option<Instant>,
+    /// The last program applied; replayed verbatim after every (re)connect.
+    program: Option<Program>,
+    /// When the program's save frames are due; `None` once sent or not wanted.
+    save_at: Option<Instant>,
 }
 
 impl Default for HidManager {
     fn default() -> Self {
         HidManager {
-            status: ConnStatus::default(),
             device: None,
             hid: None,
-            codec: None,
-            cached_eq: None,
-            last_io: None,
-            // Auto-connect is on by default; only an explicit disconnect disarms it.
             auto_connect: true,
-            program: Vec::new(),
+            retry_at: None,
+            program: None,
+            save_at: None,
         }
     }
 }
 
 impl HidManager {
-    /// True when a handle is open.
-    fn is_connected(&self) -> bool {
-        self.hid.is_some()
+    /// A disconnected manager that will replay `program` on its first connect.
+    pub fn with_program(program: Option<Program>) -> Self {
+        HidManager {
+            program,
+            ..Default::default()
+        }
     }
 
-    /// Drop the handle and reset to disconnected. Keeps `auto_connect` and the
-    /// cached `program` so the background poller can reconnect + replay.
-    fn clear_connection(&mut self) {
+    fn status(&self) -> ConnStatus {
+        if self.hid.is_some() {
+            ConnStatus::Connected
+        } else {
+            ConnStatus::Disconnected
+        }
+    }
+
+    fn close(&mut self) {
         self.hid = None;
         self.device = None;
-        self.codec = None;
-        self.last_io = None;
-        self.status = ConnStatus::Disconnected;
     }
 }
 
@@ -229,15 +133,10 @@ pub type HidState = Mutex<HidManager>;
 pub enum HidError {
     #[error("no compatible device found")]
     NotFound,
-    #[error("device is busy")]
-    #[allow(dead_code)]
-    Busy,
-    #[error("no device connected")]
-    NotConnected,
+    #[error("this device does not speak the T02 EQ protocol")]
+    Unsupported,
     #[error("device i/o error: {0}")]
     Io(String),
-    #[error("{0}")]
-    Other(String),
 }
 
 impl Serialize for HidError {
@@ -254,30 +153,27 @@ impl From<hidapi::HidError> for HidError {
 
 type CmdResult<T> = Result<T, HidError>;
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Lock the manager, mapping a poisoned mutex into a `HidError`.
-fn lock(state: &HidState) -> CmdResult<std::sync::MutexGuard<'_, HidManager>> {
-    state.lock().map_err(|e| HidError::Other(e.to_string()))
+/// Lock the manager. A poisoned lock only means another thread panicked while
+/// holding it; the data is still a coherent handle + cache, so keep going.
+fn lock(state: &HidState) -> MutexGuard<'_, HidManager> {
+    state.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Set status, store it, and emit the `conn-status` event to tray + UI.
-fn set_status_and_emit(app: &AppHandle, state: &HidState, status: ConnStatus) -> CmdResult<()> {
-    {
-        let mut mgr = lock(state)?;
-        mgr.status = status;
-    }
-    // Best-effort emit; a failed emit must not poison the connection flow.
+/// The connection as the tray and a new window need it: status and the open
+/// device.
+pub(crate) fn connection(app: &AppHandle) -> (ConnStatus, Option<DeviceInfo>) {
+    let state = app.state::<HidState>();
+    let mgr = lock(&state);
+    (mgr.status(), mgr.device.clone())
+}
+
+/// Tell the UI and the tray that the connection status changed.
+fn announce(app: &AppHandle, status: ConnStatus) {
     let _ = app.emit(CONN_STATUS_EVENT, status);
-    Ok(())
+    crate::tray::refresh(app);
 }
 
-/// Write a single HID Output Report payload on the given report id.
-///
-/// hidapi's `write` takes the report id as the FIRST byte of the buffer, so the
-/// JS `sendReport(reportId, payload)` becomes `write([reportId, payload..])`.
+/// Write one HID output report. hidapi takes the report id as the first byte.
 fn write_report(dev: &hidapi::HidDevice, report_id: u8, payload: &[u8]) -> CmdResult<()> {
     let mut buf = Vec::with_capacity(payload.len() + 1);
     buf.push(report_id);
@@ -286,270 +182,231 @@ fn write_report(dev: &hidapi::HidDevice, report_id: u8, payload: &[u8]) -> CmdRe
     Ok(())
 }
 
-/// Send the handshake / auth frame (Report 84 = ASCII "12345678").
-// VERIFIED frame; // NEEDS HARDWARE end-to-end confirmation that the device
-// acks it and then accepts command frames.
-fn send_handshake(dev: &hidapi::HidDevice) -> CmdResult<()> {
-    write_report(dev, proto::HANDSHAKE_REPORT, &proto::handshake_frame())
+/// Write a query and wait for its reply (returned without the report id), or
+/// `None` if the device stays silent.
+fn query(dev: &hidapi::HidDevice, report_id: u8, frame: &[u8]) -> CmdResult<Option<Vec<u8>>> {
+    let mut buf = [0u8; 65];
+    // Drop anything the device said before this question.
+    while dev.read_timeout(&mut buf, 0)? > 0 {}
+    write_report(dev, report_id, frame)?;
+    for _ in 0..8 {
+        let n = dev.read_timeout(&mut buf, 500)?;
+        if n == 0 {
+            break;
+        }
+        if n > 2 && buf[0] == report_id && frame.get(1) == Some(&buf[2]) {
+            return Ok(Some(buf[1..n].to_vec()));
+        }
+    }
+    Ok(None)
 }
 
-/// Build a human-friendly device name from a hidapi `DeviceInfo`.
+fn write_program(dev: &hidapi::HidDevice, program: &Program) -> CmdResult<()> {
+    program
+        .frames
+        .iter()
+        .try_for_each(|frame| write_report(dev, program.report_id, frame))
+}
+
+/// Human-friendly name from the USB manufacturer / product strings.
 fn device_name(d: &hidapi::DeviceInfo) -> String {
-    let product = d.product_string().unwrap_or("").trim().to_string();
-    let manufacturer = d.manufacturer_string().unwrap_or("").trim().to_string();
-    let label = match (manufacturer.is_empty(), product.is_empty()) {
+    let product = d.product_string().unwrap_or("").trim();
+    let manufacturer = d.manufacturer_string().unwrap_or("").trim();
+    match (manufacturer.is_empty(), product.is_empty()) {
         (false, false) => format!("{manufacturer} {product}"),
-        (true, false) => product,
-        (false, true) => manufacturer,
+        (true, false) => product.to_string(),
+        (false, true) => manufacturer.to_string(),
         (true, true) => "Walkplay DAC".to_string(),
-    };
-    if proto::is_primary(d.vendor_id(), d.product_id()) {
-        format!("{label} (primary)")
-    } else {
-        label
     }
 }
 
-/// Enumerate whitelisted HID devices, primary device first.
-fn enumerate_devices() -> CmdResult<Vec<DeviceInfo>> {
-    let api = hidapi::HidApi::new().map_err(HidError::from)?;
-    let mut out: Vec<DeviceInfo> = Vec::new();
-    let mut seen: Vec<(u16, u16)> = Vec::new();
+/// Find the device to open: the requested (vid, pid), or — when none is given —
+/// the first attached EQ device.
+fn find_device<'a>(
+    api: &'a hidapi::HidApi,
+    target: Option<(u16, u16)>,
+) -> Option<&'a hidapi::DeviceInfo> {
+    api.device_list().find(|d| {
+        let id = (d.vendor_id(), d.product_id());
+        match target {
+            Some(wanted) => id == wanted,
+            None => proto::is_eq_device(id.0, id.1),
+        }
+    })
+}
 
-    for d in api.device_list() {
-        let vid = d.vendor_id();
-        let pid = d.product_id();
-        if !proto::is_supported_vid(vid) {
-            continue;
+/// Whether the given (or any supported) device is currently attached.
+fn is_attached(target: Option<(u16, u16)>) -> Option<bool> {
+    let api = hidapi::HidApi::new().ok()?;
+    Some(find_device(&api, target).is_some())
+}
+
+/// Open a device, replay the cached program on it and store the handle.
+/// Announces `connected` on success; leaves the state untouched (and
+/// disconnected) on failure.
+///
+/// The device takes EQ commands as soon as it is open; there is no handshake.
+/// (Report 84 with "12345678" is not one — the official app sends it only to
+/// start a firmware upgrade over serial.) The one thing sent before the program
+/// is [`PROBE`], which a device of another chip family fails.
+fn connect_device(
+    app: &AppHandle,
+    state: &HidState,
+    target: Option<(u16, u16)>,
+) -> CmdResult<DeviceInfo> {
+    // Single-handle invariant: drop whatever was open first.
+    let program = {
+        let mut mgr = lock(state);
+        mgr.close();
+        mgr.program.clone()
+    };
+
+    let opened: CmdResult<(hidapi::HidDevice, DeviceInfo)> = (|| {
+        let api = hidapi::HidApi::new()?;
+        let found = find_device(&api, target).ok_or(HidError::NotFound)?;
+        let info = DeviceInfo {
+            vid: found.vendor_id(),
+            pid: found.product_id(),
+            name: device_name(found),
+        };
+        let dev = api.open_path(found.path())?;
+        if query(&dev, COMMAND_REPORT, &PROBE)?.is_none() {
+            return Err(HidError::Unsupported);
         }
-        // De-duplicate by (vid, pid): a single device can expose several HID
-        // interfaces/usages; the UI only cares about one logical device.
-        if seen.contains(&(vid, pid)) {
-            continue;
+        if let Some(program) = &program {
+            write_program(&dev, program)?;
         }
-        seen.push((vid, pid));
-        out.push(DeviceInfo {
-            vid,
-            pid,
-            name: device_name(d),
-            connected: false,
-            firmware: None,
+        Ok((dev, info))
+    })();
+
+    match opened {
+        Ok((dev, info)) => {
+            {
+                let mut mgr = lock(state);
+                mgr.hid = Some(dev);
+                mgr.device = Some(info.clone());
+                mgr.retry_at = None;
+            }
+            announce(app, ConnStatus::Connected);
+            Ok(info)
+        }
+        Err(e) => {
+            // We closed the previous handle above, so make sure nobody still
+            // believes we are connected.
+            announce(app, ConnStatus::Disconnected);
+            Err(e)
+        }
+    }
+}
+
+/// One tick of the background auto-connect / hot-unplug poller. It owns the
+/// connection lifecycle so it keeps working while no window exists.
+pub(crate) fn poll_tick(app: &AppHandle) {
+    let state = app.state::<HidState>();
+    let (open, auto_connect, retry_at) = {
+        let mgr = lock(&state);
+        (
+            mgr.device.as_ref().map(|d| (d.vid, d.pid)),
+            mgr.auto_connect,
+            mgr.retry_at,
+        )
+    };
+
+    match open {
+        // Connected: watch for hot-unplug. A failed enumeration is treated as
+        // "still there" so a transient error does not tear the connection down.
+        Some(id) => {
+            if is_attached(Some(id)) == Some(false) {
+                lock(&state).close();
+                announce(app, ConnStatus::Disconnected);
+            } else {
+                // A save that came due while the device was away goes out now.
+                save_if_due(app, false);
+            }
+        }
+        // Disconnected: connect as soon as a supported device shows up.
+        None => {
+            let waiting = retry_at.is_some_and(|t| Instant::now() < t);
+            if auto_connect
+                && !waiting
+                && is_attached(None) == Some(true)
+                && connect_device(app, &state, None).is_err()
+            {
+                lock(&state).retry_at = Some(Instant::now() + RETRY_BACKOFF);
+            }
+        }
+    }
+}
+
+/// Stream a program to the device and remember it for replay.
+///
+/// When no device is connected this is not an error: the program is cached and
+/// goes out on the next (auto-)connect. A failed write means the device went
+/// away mid-stream, so the connection is dropped and the failure reported.
+pub(crate) fn apply_program(app: &AppHandle, program: Program) -> CmdResult<()> {
+    let state = app.state::<HidState>();
+    let result = {
+        let mut mgr = lock(&state);
+        let result = match &mgr.hid {
+            Some(dev) => write_program(dev, &program),
+            None => Ok(()),
+        };
+        if result.is_err() {
+            mgr.close();
+        }
+        // A window catching up with a tray pick sends the same frames again,
+        // without save frames. That must not cancel the save the pick asked for.
+        let resend = program.save_frames.is_empty()
+            && mgr.program.as_ref().is_some_and(|p| p.frames == program.frames);
+        if !resend {
+            mgr.save_at =
+                (!program.save_frames.is_empty()).then(|| Instant::now() + SAVE_DELAY);
+            mgr.program = Some(program);
+        }
+        (result, mgr.save_at.is_some())
+    };
+    let (result, saving) = result;
+    if result.is_err() {
+        announce(app, ConnStatus::Disconnected);
+    }
+    if saving {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(SAVE_DELAY);
+            save_if_due(&app, false);
         });
     }
-
-    // Stable order: the primary 0x0666/0x0888 first, then the rest by (vid,pid).
-    out.sort_by_key(|d| {
-        let primary = !proto::is_primary(d.vid, d.pid); // false (0) sorts first
-        (primary, d.vid, d.pid)
-    });
-    Ok(out)
+    result
 }
 
-/// Open a device by (vid, pid), preferring the path that matches the primary
-/// usage. Falls back to the first matching HID interface.
-fn open_device(vid: u16, pid: u16) -> CmdResult<hidapi::HidDevice> {
-    let api = hidapi::HidApi::new().map_err(HidError::from)?;
-
-    // Try to find a concrete path first so we open a deterministic interface.
-    let path = api
-        .device_list()
-        .find(|d| d.vendor_id() == vid && d.product_id() == pid)
-        .map(|d| d.path().to_owned());
-
-    let dev = match path {
-        Some(p) => api.open_path(&p).map_err(HidError::from)?,
-        None => api.open(vid, pid).map_err(|_| HidError::NotFound)?,
+/// Send the current program's save frames if they are due (or, with `now`,
+/// merely pending — used on exit). With no device open they stay pending and
+/// go out after the next connect; a newer program replaces them.
+pub(crate) fn save_if_due(app: &AppHandle, now: bool) {
+    let state = app.state::<HidState>();
+    let mut mgr = lock(&state);
+    if !mgr.save_at.is_some_and(|due| now || Instant::now() >= due) {
+        return;
+    }
+    let sent = match (&mgr.hid, &mgr.program) {
+        (Some(dev), Some(program)) => program
+            .save_frames
+            .iter()
+            .try_for_each(|frame| write_report(dev, program.report_id, frame))
+            .is_ok(),
+        _ => false,
     };
-    Ok(dev)
+    if sent {
+        mgr.save_at = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
-/// List all currently attached compatible devices (whitelist-filtered).
-///
-/// The result marks the currently-open device (if any) as `connected: true`.
-#[tauri::command]
-pub async fn hid_list_devices(state: State<'_, HidState>) -> CmdResult<Vec<DeviceInfo>> {
-    let mut devices = enumerate_devices()?;
-
-    // Flag the open device, if we have one.
-    if let Ok(mgr) = lock(&state) {
-        if let Some(open) = &mgr.device {
-            for d in devices.iter_mut() {
-                if d.vid == open.vid && d.pid == open.pid {
-                    d.connected = true;
-                }
-            }
-        }
-    }
-    Ok(devices)
-}
-
-/// Open + handshake a device and store the live handle. Shared by the
-/// `hid_connect` command and the background auto-connect poller.
-///
-/// `vid`/`pid` are optional — when both are `None` we auto-pick: the primary
-/// 0x0666/0x0888 if present, otherwise the first whitelisted device found.
-///
-/// On success, replays the cached `program` (the UI's last full EQ push) so the
-/// device's sound is restored after a hot-plug reconnect with no window open.
-///
-/// Emits `conn-status` = `connecting` then `connected` (or back to
-/// `disconnected` on failure).
-pub(crate) fn connect_device(
-    app: &AppHandle,
-    state: &HidState,
-    vid: Option<u16>,
-    pid: Option<u16>,
-) -> CmdResult<DeviceInfo> {
-    // If something is already open, close it first (single-handle invariant).
-    {
-        let mut mgr = lock(state)?;
-        if mgr.is_connected() {
-            mgr.clear_connection();
-        }
-    }
-
-    set_status_and_emit(app, state, ConnStatus::Connecting)?;
-
-    // Resolve which device to open.
-    let resolve = || -> CmdResult<(u16, u16)> {
-        match (vid, pid) {
-            (Some(v), Some(p)) => Ok((v, p)),
-            _ => {
-                let devices = enumerate_devices()?;
-                // Prefer the primary; enumerate_devices already sorts it first.
-                devices
-                    .first()
-                    .map(|d| (d.vid, d.pid))
-                    .ok_or(HidError::NotFound)
-            }
-        }
-    };
-
-    let (v, p) = match resolve() {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = set_status_and_emit(app, state, ConnStatus::Disconnected);
-            return Err(e);
-        }
-    };
-
-    // Open + handshake.
-    let dev = match open_device(v, p) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = set_status_and_emit(app, state, ConnStatus::Disconnected);
-            return Err(e);
-        }
-    };
-
-    // Non-blocking reads so keep-alive / readback never hangs the UI thread.
-    let _ = dev.set_blocking_mode(false);
-
-    // NEEDS HARDWARE: confirm the device acks the handshake before commands.
-    if let Err(e) = send_handshake(&dev) {
-        let _ = set_status_and_emit(app, state, ConnStatus::Disconnected);
-        return Err(e);
-    }
-
-    // Pull a friendly name from the open handle if we can.
-    let name = dev
-        .get_device_info()
-        .ok()
-        .map(|di| device_name(&di))
-        .unwrap_or_else(|| {
-            if proto::is_primary(v, p) {
-                "Walkplay DAC (primary)".to_string()
-            } else {
-                "Walkplay DAC".to_string()
-            }
-        });
-
-    let info = DeviceInfo {
-        vid: v,
-        pid: p,
-        name,
-        connected: true,
-        firmware: None,
-    };
-
-    {
-        let mut mgr = lock(state)?;
-        mgr.hid = Some(dev);
-        mgr.device = Some(info.clone());
-        // Primary device uses EQ base 32; other variants would override here.
-        // NEEDS HARDWARE: alternate variants (base 53/66) are not auto-detected.
-        mgr.codec = Some(proto::Codec::new());
-        mgr.last_io = Some(Instant::now());
-        mgr.status = ConnStatus::Connected;
-
-        // Replay the UI's last program so the device sound survives a background
-        // hot-plug reconnect. No-op on a first connect (program empty); the UI's
-        // own pushToDevice will then populate it.
-        if !mgr.program.is_empty() {
-            let dev = mgr.hid.as_ref().expect("just set");
-            for (report_id, payload) in &mgr.program {
-                let _ = write_report(dev, *report_id, payload);
-            }
-        }
-    }
-
-    let _ = app.emit(CONN_STATUS_EVENT, ConnStatus::Connected);
-    Ok(info)
-}
-
-/// One tick of the background auto-connect / hot-plug poller. Drives the whole
-/// connection lifecycle so it keeps working even when no window exists.
-///
-/// Returns `Some(status)` when the connection state transitioned this tick (so
-/// the caller can refresh the tray tooltip), else `None`. Never holds the state
-/// lock across device enumeration or HID I/O.
-pub(crate) fn background_poll_tick(app: &AppHandle, state: &HidState) -> Option<ConnStatus> {
-    let (status, auto_connect, open_id) = {
-        let mgr = state.lock().ok()?;
-        (
-            mgr.status,
-            mgr.auto_connect,
-            mgr.device.as_ref().map(|d| (d.vid, d.pid)),
-        )
-    };
-
-    match status {
-        // Disconnected (and not manually disarmed) -> connect if a device is present.
-        ConnStatus::Disconnected if auto_connect => {
-            let present = enumerate_devices().map(|d| !d.is_empty()).unwrap_or(false);
-            if present && connect_device(app, state, None, None).is_ok() {
-                return Some(ConnStatus::Connected);
-            }
-            None
-        }
-        // Connected -> watch for hot-unplug (open device no longer enumerable).
-        ConnStatus::Connected => {
-            let (vid, pid) = open_id?;
-            let gone = match enumerate_devices() {
-                Ok(list) => !list.iter().any(|d| d.vid == vid && d.pid == pid),
-                Err(_) => false, // transient enumeration error — don't tear down
-            };
-            if gone {
-                if let Ok(mut mgr) = state.lock() {
-                    mgr.clear_connection();
-                }
-                let _ = app.emit(CONN_STATUS_EVENT, ConnStatus::Disconnected);
-                return Some(ConnStatus::Disconnected);
-            }
-            None
-        }
-        // Connecting / Busy (e.g. firmware flash): leave the poller hands-off.
-        _ => None,
-    }
-}
-
-/// Open and handshake with a device (command wrapper around [`connect_device`]).
-///
-/// Re-arms auto-connect so future hot-plug events reconnect automatically.
+/// Connect on the user's request. Omit `vid`/`pid` to auto-pick a device.
+/// Re-arms auto-connect for future hot-plug events.
 #[tauri::command]
 pub async fn hid_connect(
     app: AppHandle,
@@ -557,358 +414,68 @@ pub async fn hid_connect(
     vid: Option<u16>,
     pid: Option<u16>,
 ) -> CmdResult<DeviceInfo> {
-    {
-        let mut mgr = lock(&state)?;
-        mgr.auto_connect = true;
-    }
-    connect_device(&app, &state, vid, pid)
+    lock(&state).auto_connect = true;
+    connect_device(&app, &state, vid.zip(pid))
 }
 
-/// Close the active connection. Idempotent.
-///
-/// This is an *explicit* user disconnect, so it disarms `auto_connect`: the
-/// background poller will not silently reconnect until the user connects again.
+/// Disconnect on the user's request. Idempotent. Disarms auto-connect so the
+/// poller does not immediately reconnect.
 #[tauri::command]
 pub async fn hid_disconnect(app: AppHandle, state: State<'_, HidState>) -> CmdResult<()> {
     {
-        let mut mgr = lock(&state)?;
-        mgr.clear_connection();
+        let mut mgr = lock(&state);
+        mgr.close();
         mgr.auto_connect = false;
     }
-    let _ = app.emit(CONN_STATUS_EVENT, ConnStatus::Disconnected);
+    announce(&app, ConnStatus::Disconnected);
     Ok(())
 }
 
-/// Current connection snapshot, for a freshly (re)created window to seed its
-/// store from — the backend may already be connected (or have reconnected in
-/// the background) while no window existed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnStatusInfo {
-    pub status: ConnStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<DeviceInfo>,
-}
-
-/// Return the live connection status + open device (if any).
+/// Apply the UI's current EQ as one program (a single IPC round trip, written
+/// atomically under the device lock). `preset_id` names the preset the program
+/// equals, if any, so the tray can tick it. `save_frames` are given when the
+/// device should keep the program (see [`Program::save_frames`]).
 #[tauri::command]
-pub async fn hid_status(state: State<'_, HidState>) -> CmdResult<ConnStatusInfo> {
-    let mgr = lock(&state)?;
-    Ok(ConnStatusInfo {
-        status: mgr.status,
-        device: mgr.device.clone(),
-    })
-}
-
-/// Apply a full program (write each frame to the device) and record it as the
-/// active program for hot-plug replay. Used by the tray "Quick EQ" handler when
-/// no window is open. No-op writes when disconnected, but still caches the
-/// program so the next (auto-)connect replays the just-selected preset.
-pub(crate) fn apply_program(state: &HidState, report_id: u8, frames: &[Vec<u8>]) {
-    let mut mgr = match state.lock() {
-        Ok(m) => m,
-        Err(_) => return,
+pub async fn hid_apply_program(
+    app: AppHandle,
+    report_id: u8,
+    frames: Vec<Vec<u8>>,
+    save_frames: Option<Vec<Vec<u8>>>,
+    preset_id: Option<String>,
+) -> CmdResult<()> {
+    let program = Program {
+        report_id,
+        frames,
+        save_frames: save_frames.unwrap_or_default(),
     };
-    if mgr.is_connected() {
-        let dev = mgr.hid.as_ref().expect("connected");
-        for f in frames {
-            let _ = write_report(dev, report_id, f);
-        }
-        mgr.last_io = Some(Instant::now());
-    }
-    mgr.program = frames.iter().map(|f| (report_id, f.clone())).collect();
+    crate::tray::record_program(&app, &program, preset_id, false);
+    apply_program(&app, program)
 }
 
-/// Register the UI's current full EQ program (the exact frames it last pushed)
-/// so the background poller can replay it verbatim after a hot-plug reconnect.
-///
-/// All frames share one `report_id` (the T02 coeff protocol streams on a single
-/// report). Passing an empty list clears the cache (e.g. on factory reset).
+/// Write frames once, without remembering them — for commands that must not be
+/// replayed on reconnect, such as a factory reset. Fails when no device is open.
 #[tauri::command]
-pub async fn hid_set_program(
+pub async fn hid_send(
     state: State<'_, HidState>,
     report_id: u8,
     frames: Vec<Vec<u8>>,
 ) -> CmdResult<()> {
-    let mut mgr = lock(&state)?;
-    mgr.program = frames.into_iter().map(|f| (report_id, f)).collect();
-    Ok(())
-}
-
-/// Read the full EQ (all bands + preamp) back from the device.
-///
-/// # Verification
-///
-/// `// INFERRED` + `// NEEDS HARDWARE`. The original web bundle's primary
-/// device class implements `readFilterInfo(){}` as a no-op, so the wire shape of
-/// the device's EQ *response* is unproven. We:
-///
-/// 1. Send a register READ frame for each band address (best-effort poke),
-/// 2. Try to drain any input reports and decode them via [`proto::Codec`],
-/// 3. Fall back to the last cached EQ we wrote — or a flat default — so the UI
-///    always has a coherent state to render.
-///
-/// When real hardware is available, replace step 2's parsing with the confirmed
-/// response framing and drop the cache fallback.
-#[tauri::command]
-pub async fn hid_read_eq(state: State<'_, HidState>) -> CmdResult<EqState> {
-    let mut mgr = lock(&state)?;
-    if !mgr.is_connected() {
-        return Err(HidError::NotConnected);
-    }
-
-    // Best-effort device interaction. We never fail the command on a read miss;
-    // we degrade to the cache so the editor stays usable.
-    let decoded: Option<EqState> = {
-        let dev = mgr.hid.as_ref().expect("connected");
-        // Codec is not Clone; rebuild one from the connected variant's base.
-        let eq_base = mgr.codec.as_ref().map(|c| c.eq_base).unwrap_or(proto::EQ_BASE_ADDR);
-        let codec = proto::Codec::with_base(eq_base);
-
-        // Poke each band's two register addresses with a READ frame.
-        // NEEDS HARDWARE: firmware may instead bulk-dump on a single request.
-        let base = proto::EQ_BASE_ADDR;
-        for i in 0..proto::NUM_BANDS as u8 {
-            let addr_a = base + 2 * i;
-            let addr_b = base + 2 * i + 1;
-            let fa = proto::register_frame(addr_a, proto::CMD_READ, [0, 0, 0, 0]);
-            let fb = proto::register_frame(addr_b, proto::CMD_READ, [0, 0, 0, 0]);
-            let _ = write_report(dev, proto::COMMAND_REPORT, &fa);
-            let _ = write_report(dev, proto::COMMAND_REPORT, &fb);
-        }
-
-        // Drain whatever the device returns (non-blocking handle).
-        let mut collected: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 64];
-        for _ in 0..(proto::NUM_BANDS * 2 + 4) {
-            match dev.read_timeout(&mut buf, 20) {
-                Ok(n) if n >= 10 => {
-                    // hidapi may or may not prefix the report id depending on the
-                    // OS/descriptor. We expect raw 10-byte register frames whose
-                    // byte 0 is a register address in the EQ block.
-                    // NEEDS HARDWARE: confirm whether a leading report-id byte is
-                    // present and strip it if so.
-                    collected.extend_from_slice(&buf[..n]);
-                }
-                Ok(_) => break,
-                Err(_) => break,
-            }
-        }
-
-        // Try to decode a contiguous, frame-aligned slice.
-        let aligned_len = (collected.len() / 10) * 10;
-        codec
-            .decode_eq(&collected[..aligned_len])
-            .map(|wire_bands: Vec<proto::EqBandWire>| wire_to_eq_state(&wire_bands))
-    };
-
-    if let Some(eq) = decoded {
-        mgr.cached_eq = Some(eq.clone());
-        mgr.last_io = Some(Instant::now());
-        return Ok(eq);
-    }
-
-    // Fallback: last thing we wrote, else a flat default.
-    let eq = mgr.cached_eq.clone().unwrap_or_default();
-    Ok(eq)
-}
-
-/// Build a UI `EqState` from decoded wire bands, preserving preamp from cache
-/// (preamp has no readback in the bundle).
-fn wire_to_eq_state(wire: &[proto::EqBandWire]) -> EqState {
-    let bands = wire
+    let mgr = lock(&state);
+    let dev = mgr.hid.as_ref().ok_or(HidError::NotFound)?;
+    frames
         .iter()
-        .map(|w| EqBand {
-            id: w.index as u32,
-            freq: w.freq,
-            q: w.q,
-            gain: w.gain,
-            band_type: filter_to_ui_type(w.filter).to_string(),
-            enabled: w.enabled,
-        })
-        .collect();
-    EqState { bands, preamp: 0.0 }
+        .try_for_each(|frame| write_report(dev, report_id, frame))
 }
 
-/// Write a single band to the device.
-///
-/// Encodes both register frames (gain+freq, then Q+type) via the protocol crate
-/// and pushes them on Report ID 75, then flushes to volatile memory so the
-/// change takes effect immediately (mirroring the web app's per-edit flush).
-// VERIFIED frame layout; // NEEDS HARDWARE end-to-end confirmation.
+/// Ask the device a question: write `frame` and return its reply, without the
+/// report id. A reply repeats the query's command byte as its second byte.
 #[tauri::command]
-pub async fn hid_write_band(state: State<'_, HidState>, band: EqBand) -> CmdResult<()> {
-    let mut mgr = lock(&state)?;
-    if !mgr.is_connected() {
-        return Err(HidError::NotConnected);
-    }
-
-    let wire = ui_band_to_wire(&band);
-    let frames = proto::encode_band(&wire); // 20 bytes = two 10-byte frames
-
-    {
-        let dev = mgr.hid.as_ref().expect("connected");
-        write_report(dev, proto::COMMAND_REPORT, &frames[..10])?;
-        write_report(dev, proto::COMMAND_REPORT, &frames[10..])?;
-        // Apply immediately (RAM). Persisting to flash is a separate explicit
-        // action; we keep edits cheap and non-wearing here.
-        let _ = write_report(dev, proto::COMMAND_REPORT, &proto::flush_to_memory_frame());
-    }
-
-    // Keep the cache coherent so a subsequent read_eq reflects the edit even if
-    // hardware readback is unavailable.
-    update_cached_band(&mut mgr, &band);
-    mgr.last_io = Some(Instant::now());
-    Ok(())
-}
-
-/// Send a raw HID output report (report id + payload bytes) to the connected device.
-///
-/// Used by the T02-family (0x3302) EQ protocol, where the frontend computes the exact
-/// biquad-coefficient frames (validated byte-for-byte against the official web app) and
-/// streams them here verbatim. See `src/features/eq/t02-protocol.ts`.
-#[tauri::command]
-pub async fn hid_send_raw(
+pub async fn hid_query(
     state: State<'_, HidState>,
     report_id: u8,
-    data: Vec<u8>,
-) -> CmdResult<()> {
-    let mut mgr = lock(&state)?;
-    if !mgr.is_connected() {
-        return Err(HidError::NotConnected);
-    }
-    {
-        let dev = mgr.hid.as_ref().expect("connected");
-        write_report(dev, report_id, &data)?;
-    }
-    mgr.last_io = Some(Instant::now());
-    Ok(())
-}
-
-/// Patch the cached EQ snapshot with a single edited band.
-fn update_cached_band(mgr: &mut HidManager, band: &EqBand) {
-    let eq = mgr.cached_eq.get_or_insert_with(EqState::default);
-    if let Some(existing) = eq.bands.iter_mut().find(|b| b.id == band.id) {
-        *existing = band.clone();
-    } else {
-        eq.bands.push(band.clone());
-    }
-}
-
-/// Write the global preamp / pre-gain to the device.
-// VERIFIED frame layout (negated ×10 int32 at addr 87); // NEEDS HARDWARE.
-#[tauri::command]
-pub async fn hid_write_preamp(state: State<'_, HidState>, preamp: f32) -> CmdResult<()> {
-    let mut mgr = lock(&state)?;
-    if !mgr.is_connected() {
-        return Err(HidError::NotConnected);
-    }
-
-    let frame = proto::encode_preamp(preamp);
-    {
-        let dev = mgr.hid.as_ref().expect("connected");
-        write_report(dev, proto::COMMAND_REPORT, &frame)?;
-        let _ = write_report(dev, proto::COMMAND_REPORT, &proto::flush_to_memory_frame());
-    }
-
-    mgr.cached_eq.get_or_insert_with(EqState::default).preamp = preamp;
-    mgr.last_io = Some(Instant::now());
-    Ok(())
-}
-
-/// Reset the device EQ to factory defaults.
-// VERIFIED frame (addr 0, cmd 'C'); // NEEDS HARDWARE.
-#[tauri::command]
-pub async fn hid_factory_reset(state: State<'_, HidState>) -> CmdResult<()> {
-    let mut mgr = lock(&state)?;
-    if !mgr.is_connected() {
-        return Err(HidError::NotConnected);
-    }
-
-    {
-        let dev = mgr.hid.as_ref().expect("connected");
-        write_report(dev, proto::COMMAND_REPORT, &proto::factory_reset_frame())?;
-        // Persist the reset to flash so it survives a power cycle.
-        let _ = write_report(dev, proto::COMMAND_REPORT, &proto::flush_to_flash_frame());
-    }
-
-    // Reset the cache to flat defaults too, and drop the replay program so a
-    // later background reconnect doesn't re-apply the pre-reset EQ.
-    mgr.cached_eq = Some(EqState::default());
-    mgr.program.clear();
-    mgr.last_io = Some(Instant::now());
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_eq_has_ten_flat_bands() {
-        let eq = EqState::default();
-        assert_eq!(eq.bands.len(), proto::NUM_BANDS);
-        assert!(eq.bands.iter().all(|b| b.gain == 0.0));
-        assert_eq!(eq.preamp, 0.0);
-    }
-
-    #[test]
-    fn ui_type_roundtrip() {
-        for s in ["PK", "LS", "HS", "LP", "HP"] {
-            let f = ui_type_to_filter(s);
-            assert_eq!(filter_to_ui_type(f), s);
-        }
-        // Unknown collapses to PK.
-        assert_eq!(ui_type_to_filter("???"), proto::FilterType::Peaking);
-    }
-
-    #[test]
-    fn disabled_band_flattens_to_peaking_0db() {
-        let b = EqBand {
-            id: 3,
-            freq: 1000.0,
-            q: 1.0,
-            gain: 6.0,
-            band_type: "HS".into(),
-            enabled: false,
-        };
-        let w = ui_band_to_wire(&b);
-        assert_eq!(w.index, 3);
-        assert_eq!(w.gain, 0.0);
-        assert_eq!(w.filter, proto::FilterType::Peaking);
-    }
-
-    #[test]
-    fn enabled_band_maps_through() {
-        let b = EqBand {
-            id: 2,
-            freq: 500.0,
-            q: 0.707,
-            gain: -3.0,
-            band_type: "LS".into(),
-            enabled: true,
-        };
-        let w = ui_band_to_wire(&b);
-        assert_eq!(w.gain, -3.0);
-        assert_eq!(w.filter, proto::FilterType::LowShelf);
-        // The encoded bytes should match the protocol crate's verified layout.
-        let bytes = proto::encode_band(&w);
-        assert_eq!(bytes.len(), 20);
-    }
-
-    #[test]
-    fn update_cached_band_replaces_in_place() {
-        let mut mgr = HidManager::default();
-        let b = EqBand {
-            id: 0,
-            freq: 100.0,
-            q: 1.0,
-            gain: 4.0,
-            band_type: "PK".into(),
-            enabled: true,
-        };
-        update_cached_band(&mut mgr, &b);
-        let eq = mgr.cached_eq.as_ref().unwrap();
-        assert_eq!(eq.bands[0].gain, 4.0);
-        assert_eq!(eq.bands.len(), proto::NUM_BANDS);
-    }
+    frame: Vec<u8>,
+) -> CmdResult<Vec<u8>> {
+    let mgr = lock(&state);
+    let dev = mgr.hid.as_ref().ok_or(HidError::NotFound)?;
+    query(dev, report_id, &frame)?.ok_or_else(|| HidError::Io("no reply from device".into()))
 }

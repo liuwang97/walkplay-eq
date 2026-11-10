@@ -1,136 +1,75 @@
 /**
  * Built-in EQ presets (预设).
  *
- * Each preset is a full 10-band PEQ snapshot + preamp, matching the hardware
- * layout in src/lib/types.ts (band 0 = LS @60Hz, band 9 = HS @10kHz, the eight
- * in between = PK). Gains are clamped to the device range (-10..10 dB) and the
- * preamp to (-16..6 dB). Frequencies/Qs reuse DEFAULT_BANDS so every preset is a
- * drop-in replacement the device can accept band-for-band.
- *
- * `name` carries an i18n key (preset.builtin.*); the panel resolves it via t()
- * and falls back to the embedded zh label when the key is missing.
+ * OFFICIAL is the vendor's own preset list for the T02, copied verbatim from
+ * the official web app (peq.szwalkplay.com, its `eq.preEqList` store, read on
+ * 2026-11-11): 8 peaking bands each, preamp 0.
  */
 
-import { DEFAULT_BANDS, type EqBand, type Preset } from "@/lib/types";
+import type { Language } from "@/i18n";
+import type { EqBand, Preset } from "@/lib/types";
 
-/** Per-band gain in dB, indexed 0..9 (low -> high). */
-type GainCurve = readonly [
-  number, number, number, number, number,
-  number, number, number, number, number,
-];
+type Eight = readonly [number, number, number, number, number, number, number, number];
 
-/** Build the 10 bands for a preset from a gain curve, keeping freq/q/type. */
-function bands(curve: GainCurve): EqBand[] {
-  return DEFAULT_BANDS.map((b, i) => ({ ...b, gain: curve[i] }));
-}
-
-/** A compact authoring shape; expanded into a full {@link Preset} below. */
-interface BuiltinSpec {
+interface OfficialPreset {
   id: string;
-  /** i18n key resolved by the panel. */
-  i18nKey: string;
-  /** zh fallback label used when the i18n key is absent. */
-  label: string;
-  preamp: number;
-  curve: GainCurve;
+  zh: string;
+  en: string;
+  freqs: Eight;
+  qs: Eight;
+  gains: Eight;
 }
 
-const SPECS: readonly BuiltinSpec[] = [
+const Q_FLAT: Eight = [0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75];
+const Q_WIDE_ENDS: Eight = [0.65, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.6];
+const F_STANDARD: Eight = [50, 125, 250, 500, 1000, 2000, 4000, 10000];
+const F_LOW: Eight = [31, 62, 125, 250, 500, 1000, 2000, 4000];
+
+const OFFICIAL: readonly OfficialPreset[] = [
   {
     id: "builtin-flat",
-    i18nKey: "preset.builtin.flat",
-    label: "默认",
-    preamp: 0,
-    curve: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    zh: "纯净",
+    en: "Pure",
+    freqs: [50, 200, 500, 1000, 2500, 5000, 10000, 15000],
+    qs: Q_FLAT,
+    gains: [0, 0, 0, 0, 0, 0, 0, 0],
+  },
+  { id: "builtin-pop", zh: "流行", en: "Pop", freqs: F_STANDARD, qs: Q_WIDE_ENDS, gains: [6, -3, -2, 5, 4, -4, -3, 8] },
+  { id: "builtin-rock", zh: "摇滚", en: "Rock", freqs: F_STANDARD, qs: Q_WIDE_ENDS, gains: [6, 2, 1, -3, -4, 2, 1, 6] },
+  { id: "builtin-vocal", zh: "人声", en: "Vocal", freqs: F_STANDARD, qs: Q_WIDE_ENDS, gains: [-6, 4, -3, 3, 4, 5, 4, -5] },
+  { id: "builtin-bass", zh: "重低音", en: "Bass", freqs: F_LOW, qs: Q_FLAT, gains: [3, 3, 5, 3, 0, -1, -1, -1] },
+  // The official English label for this one is "FLAT", which it is not.
+  { id: "builtin-soft", zh: "柔和", en: "Soft", freqs: F_LOW, qs: Q_FLAT, gains: [-5, -5, -4, -4, 3, 2, 4, 4] },
+  {
+    id: "builtin-cinema",
+    zh: "影院",
+    en: "Cinema",
+    freqs: [50, 125, 250, 500, 1000, 4000, 6000, 8000],
+    qs: [0.65, 0.75, 0.6, 0.75, 0.75, 0.75, 0.12, 0.6],
+    gains: [3, 4, 5, 2, 0, 4, 2, 4.8],
   },
   {
-    id: "builtin-pop",
-    i18nKey: "preset.builtin.pop",
-    label: "流行",
-    preamp: -2,
-    curve: [2, 3, 1, -1, -1, 0, 1, 2, 3, 2],
-  },
-  {
-    id: "builtin-rock",
-    i18nKey: "preset.builtin.rock",
-    label: "摇滚",
-    preamp: -3,
-    curve: [4, 3, 1, -1, -2, -1, 1, 3, 4, 3],
-  },
-  {
-    id: "builtin-classical",
-    i18nKey: "preset.builtin.classical",
-    label: "古典",
-    preamp: -1,
-    curve: [3, 2, 0, 0, 0, 0, -1, -2, 2, 3],
-  },
-  {
-    id: "builtin-vocal",
-    i18nKey: "preset.builtin.vocal",
-    label: "人声",
-    preamp: -2,
-    curve: [-2, -1, 1, 2, 3, 3, 2, 1, -1, -2],
-  },
-  {
-    id: "builtin-bass",
-    i18nKey: "preset.builtin.bass",
-    label: "重低音",
-    preamp: -4,
-    curve: [6, 5, 3, 1, 0, 0, 0, 0, 0, 0],
-  },
-  {
-    id: "builtin-treble",
-    i18nKey: "preset.builtin.treble",
-    label: "高音增强",
-    preamp: -3,
-    curve: [0, 0, 0, 0, 0, 1, 2, 4, 5, 5],
-  },
-  {
-    id: "builtin-jazz",
-    i18nKey: "preset.builtin.jazz",
-    label: "爵士",
-    preamp: -1,
-    curve: [3, 2, 1, 1, -1, -1, 0, 1, 2, 2],
-  },
-  {
-    id: "builtin-electronic",
-    i18nKey: "preset.builtin.electronic",
-    label: "电子",
-    preamp: -3,
-    curve: [4, 3, 1, 0, -2, 1, 1, 2, 4, 4],
-  },
-  {
-    id: "builtin-acoustic",
-    i18nKey: "preset.builtin.acoustic",
-    label: "原声",
-    preamp: -1,
-    curve: [2, 2, 1, 1, 1, 1, 2, 2, 2, 1],
+    id: "builtin-game",
+    zh: "游戏",
+    en: "Game",
+    freqs: [50, 125, 250, 500, 1000, 4000, 6000, 10000],
+    qs: [0.6, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75],
+    gains: [-7, 5, 4, 3, 4, 4, 3.5, 4],
   },
 ];
 
-/**
- * Full per-band presets (specific freq/Q/type per band, not derived from
- * DEFAULT_BANDS). Used for device-tuned AutoEQ curves imported from the official
- * app — these map 1:1 onto the T02's 8 bands.
- */
-function band(
-  id: number,
-  freq: number,
-  q: number,
-  gain: number,
-  type: EqBand["type"],
-): EqBand {
+function band(id: number, freq: number, q: number, gain: number, type: EqBand["type"]): EqBand {
   return { id, freq, q, gain, type, enabled: true };
 }
 
-const FULL_PRESETS: readonly Preset[] = [
+const TUNINGS: readonly Preset[] = [
   {
     // Sony WH-1000XM5, AutoEQ Harman-target tuning — imported verbatim from the
     // official WalkPlay app's custom preset "WH1000XM5 AutoEQ哈曼曲线2025".
     id: "builtin-wh1000xm5-autoeq-harman-2025",
     name: "WH-1000XM5 AutoEQ 哈曼2025",
     preamp: -6,
-    source: "preset" as const,
+    source: "preset",
     bands: [
       band(0, 105, 0.71, 6.1, "LS"),
       band(1, 220, 1.2, -7, "PK"),
@@ -144,21 +83,23 @@ const FULL_PRESETS: readonly Preset[] = [
   },
 ];
 
-/**
- * The built-in preset library. Marked `source: "preset"` so the panel renders
- * the 预设 badge and never offers a delete/edit affordance for them.
- */
+/** The built-in library. `name` holds the zh label; see {@link presetLabel}. */
 export const BUILTIN_PRESETS: readonly Preset[] = [
-  ...SPECS.map((s) => ({
-    id: s.id,
-    name: s.i18nKey,
-    bands: bands(s.curve),
-    preamp: s.preamp,
+  ...OFFICIAL.map((p, i) => ({
+    id: p.id,
+    name: p.zh,
+    // The official app numbers its presets 1..8 in this order.
+    tag: i + 1,
+    bands: p.freqs.map((freq, i) => band(i, freq, p.qs[i], p.gains[i], "PK")),
+    preamp: 0,
     source: "preset" as const,
   })),
-  ...FULL_PRESETS,
+  ...TUNINGS,
 ];
 
-/** zh fallback labels keyed by i18n key, for when a translation is missing. */
-export const BUILTIN_FALLBACK_LABELS: Readonly<Record<string, string>> =
-  Object.fromEntries(SPECS.map((s) => [s.i18nKey, s.label]));
+const EN_LABELS = new Map(OFFICIAL.map((p) => [p.id, p.en]));
+
+/** A preset's display name in the given language (built-ins are bilingual). */
+export function presetLabel(preset: Pick<Preset, "id" | "name">, lang: Language): string {
+  return (lang === "en" && EN_LABELS.get(preset.id)) || preset.name;
+}

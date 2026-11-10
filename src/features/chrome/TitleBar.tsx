@@ -5,14 +5,11 @@
  * (`design-ref/project/WalkPlay EQ.dc.html`, lines 28-52), built with INLINE
  * styles to match the macOS-grade light UI exactly.
  *
- * Left   : macOS traffic lights (decorative) + accent brand mark + "WalkPlay".
+ * Left   : macOS-style traffic lights (close / minimize / maximize) + accent
+ *          brand mark + "WalkPlay".
  * Center : the "参数均衡器" / "Parametric EQ" subtitle.
- * Right  : a live connection status pill (mirrors ConnectionBar's connect /
- *          disconnect + toast behavior), the firmware dialog entry point, and a
- *          language toggle button.
- *
- * Connection logic and i18n keys are reused from `ConnectionBar` so behavior is
- * identical — only the presentation differs.
+ * Right  : a live connection status pill (click to connect / disconnect) and
+ *          a language toggle button.
  */
 
 import * as React from "react";
@@ -20,9 +17,7 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import FirmwareDialog from "@/features/firmware/FirmwareDialog";
-import { setLanguage } from "@/i18n";
-import { K } from "@/i18n/keys";
+import { K, setLanguage, useLang } from "@/i18n";
 import { isTauri } from "@/lib/bridge";
 import { useEqStore } from "@/lib/store";
 import { palette } from "@/lib/theme";
@@ -44,30 +39,28 @@ function windowAction(action: "close" | "minimize" | "maximize"): void {
 }
 
 export function TitleBar() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
+  const lang = useLang();
   const status = useEqStore((s) => s.status);
   const device = useEqStore((s) => s.device);
   const accent = useEqStore((s) => s.accent);
   const connect = useEqStore((s) => s.connect);
   const disconnect = useEqStore((s) => s.disconnect);
-  const loadFromDevice = useEqStore((s) => s.loadFromDevice);
 
   const pal = palette(accent);
-  const lang = i18n.language?.startsWith("en") ? "en" : "zh";
   const subtitle = lang === "en" ? "Parametric EQ" : "参数均衡器";
 
   const connected = status === "connected";
-  const connecting = status === "connecting" || status === "busy";
+  const connecting = status === "connecting";
 
   const handleConnect = React.useCallback(async () => {
     try {
       await connect();
-      await loadFromDevice().catch(() => {});
       toast.success(t(K.connection.connected));
     } catch (err) {
       toast.error(t(K.connection.deviceInitFailed), { description: String(err) });
     }
-  }, [connect, loadFromDevice, t]);
+  }, [connect, t]);
 
   const handleDisconnect = React.useCallback(async () => {
     try {
@@ -100,14 +93,9 @@ export function TitleBar() {
         padding: "0 18px",
         background: "linear-gradient(180deg, #fcfcfe 0%, #f4f5f9 100%)",
         borderBottom: "1px solid rgba(28,32,58,0.08)",
-        fontFamily: "'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif",
-        color: "#1b1f2e",
         userSelect: "none",
       }}
     >
-      <style>
-        {"@keyframes wpPulse{0%,100%{opacity:1}50%{opacity:0.45}}"}
-      </style>
 
       {/* Traffic lights — real window controls (close / minimize / maximize) */}
       <TrafficLights />
@@ -163,7 +151,6 @@ export function TitleBar() {
       {/* Right group */}
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <ConnectionPill
-          status={status}
           connected={connected}
           connecting={connecting}
           deviceName={device?.name}
@@ -176,9 +163,6 @@ export function TitleBar() {
           )}
           onClick={onPillClick}
         />
-
-        {/* Firmware entry point — provides its own trigger button. */}
-        <FirmwareDialog />
 
         {/* Language toggle */}
         <button
@@ -207,14 +191,12 @@ export function TitleBar() {
 
 /** Live connection status pill. Green when connected, amber connecting, gray (clickable) when disconnected. */
 function ConnectionPill({
-  status,
   connected,
   connecting,
   deviceName,
   label,
   onClick,
 }: {
-  status: string;
   connected: boolean;
   connecting: boolean;
   deviceName?: string;
@@ -279,7 +261,7 @@ function ConnectionPill({
           borderRadius: "50%",
           background: tone.dot,
           boxShadow: tone.dotRing,
-          animation: status === "connecting" || status === "busy" ? "wpPulse 1.2s ease-in-out infinite" : undefined,
+          animation: connecting ? "wpPulse 1.2s ease-in-out infinite" : undefined,
         }}
       />
       <span

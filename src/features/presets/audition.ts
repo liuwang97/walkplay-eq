@@ -5,7 +5,7 @@
  * synthesize a short looping music bed (a lo-fi pad + bass + arpeggio + soft
  * hats, covering low/mid/high so every EQ band is audible) entirely in the
  * WebAudio graph — no bundled audio files — and run it through a BiquadFilter
- * chain that mirrors the preset's 10 PEQ bands + preamp. This lets the user
+ * chain that mirrors the preset's PEQ bands + preamp. This lets the user
  * hear the *shape* of a preset on actual music before committing it to the
  * hardware with 使用. It never touches the HID layer.
  *
@@ -23,6 +23,10 @@ function biquadType(t: EqBandType): BiquadFilterType {
       return "lowshelf";
     case "HS":
       return "highshelf";
+    case "LP":
+      return "lowpass";
+    case "HP":
+      return "highpass";
     case "PK":
     default:
       return "peaking";
@@ -246,11 +250,14 @@ class AuditionEngine {
 
     let node: AudioNode = input;
     for (const band of bands) {
-      if (!band.enabled || band.gain === 0) continue;
+      const pass = band.type === "LP" || band.type === "HP";
+      // A pass filter shapes the sound whatever its gain; the others are flat at 0 dB.
+      if (!band.enabled || (band.gain === 0 && !pass)) continue;
       const f = ctx.createBiquadFilter();
       f.type = biquadType(band.type);
       f.frequency.value = band.freq;
-      f.Q.value = band.q;
+      // WebAudio takes a pass filter's Q in dB.
+      f.Q.value = pass ? 20 * Math.log10(band.q) : band.q;
       f.gain.value = band.gain;
       node.connect(f);
       node = f;

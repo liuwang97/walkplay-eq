@@ -6,33 +6,36 @@
  *
  * Layout (horizontal flex, align-items center, gap 14):
  *   [ title + bands badge ] [ master toggle ] [ flex spacer ]
- *   [ live FREQ|GAIN readout ] [ A/B segmented + copy ] [ reset ]
+ *   [ live FREQ|GAIN readout ] [ A/B segmented + copy ] [ reset ] [ more ]
+ *
+ * The overflow menu holds: update custom EQ, restore default EQ, launch at startup.
  *
  * Takes no props — everything is read from the global EQ store.
  */
 
 import type { CSSProperties } from "react";
-import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import { MoreHorizontal, RefreshCw, Share2, Factory } from "lucide-react";
+import { MoreHorizontal, RefreshCw, Factory } from "lucide-react";
 
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { useLang } from "@/i18n";
+import { isTauri } from "@/lib/bridge";
 import { useEqStore } from "@/lib/store";
 import { fmtFreq, hexA, palette } from "@/lib/theme";
 import type { Preset } from "@/lib/types";
 
 const MONO = "'JetBrains Mono', monospace";
 
-type Lang = "zh" | "en";
-
 const TX = {
   equalizer: { zh: "均衡器", en: "Equalizer" },
-  bandsLabel: { zh: "10 频段", en: "10 Bands" },
+  bands: { zh: "频段", en: "Bands" },
   masterOn: { zh: "均衡开启", en: "EQ On" },
   masterOff: { zh: "均衡关闭", en: "EQ Off" },
   freq: { zh: "FREQ", en: "FREQ" },
@@ -41,13 +44,19 @@ const TX = {
   copy: { zh: "复制到另一槽", en: "Copy to other slot" },
   more: { zh: "更多操作", en: "More actions" },
   updateCustom: { zh: "更新自定义 EQ", en: "Update custom EQ" },
-  share: { zh: "分享 EQ", en: "Share EQ" },
-  factory: { zh: "恢复出厂", en: "Factory reset" },
+  factory: { zh: "恢复默认 EQ", en: "Restore default EQ" },
+  autostart: { zh: "开机自启动", en: "Launch at startup" },
+  cleared: { zh: "已重置均衡器", en: "Equalizer cleared" },
+  updateDone: { zh: "已更新自定义 EQ", en: "Custom EQ updated" },
+  updateNoTarget: {
+    zh: "请先在「自定义」里选择一个要更新的 EQ",
+    en: "Select a custom EQ to update first",
+  },
+  factoryDone: { zh: "已恢复默认 EQ", en: "Default EQ restored" },
 } as const;
 
 export default function Toolbar() {
-  const { i18n } = useTranslation();
-  const lang: Lang = i18n.language?.startsWith("en") ? "en" : "zh";
+  const lang = useLang();
 
   const bands = useEqStore((s) => s.eq.bands);
   const selected = useEqStore((s) => s.selected);
@@ -60,26 +69,17 @@ export default function Toolbar() {
   const toggleMaster = useEqStore((s) => s.toggleMaster);
   const applyPreset = useEqStore((s) => s.applyPreset);
   const updateCustom = useEqStore((s) => s.updateCustom);
-  const factoryReset = useEqStore((s) => s.factoryReset);
+  const resetToDefault = useEqStore((s) => s.resetToDefault);
+  const autostart = useEqStore((s) => s.autostart);
+  const setAutostart = useEqStore((s) => s.setAutostart);
 
   const C = palette(accent);
 
-  const onUpdateCustom = () => {
-    const ok = updateCustom();
-    toast(
-      ok
-        ? t("eq.toast.updateDone", lang)
-        : t("eq.toast.updateNoTarget", lang),
-    );
-  };
-  const onShare = () => toast(t("eq.toast.sharePending", lang));
-  const onFactoryReset = async () => {
-    try {
-      await factoryReset();
-      toast(t("eq.toast.factoryReset", lang));
-    } catch (err) {
-      toast.error(t("eq.toast.factoryResetFailed", lang), { description: String(err) });
-    }
+  const onUpdateCustom = () =>
+    toast((updateCustom() ? TX.updateDone : TX.updateNoTarget)[lang]);
+  const onFactoryReset = () => {
+    resetToDefault();
+    toast(TX.factoryDone[lang]);
   };
 
   const band = bands[selected];
@@ -99,7 +99,7 @@ export default function Toolbar() {
       bands: bands.map((b) => ({ ...b, gain: 0 })),
     };
     applyPreset(flat);
-    toast(t("eq.toast.cleared", lang));
+    toast(TX.cleared[lang]);
   };
 
   // --- styles ---
@@ -167,7 +167,7 @@ export default function Toolbar() {
             whiteSpace: "nowrap",
           }}
         >
-          {TX.bandsLabel[lang]}
+          {bands.length} {TX.bands[lang]}
         </span>
       </div>
 
@@ -317,36 +317,23 @@ export default function Toolbar() {
             <RefreshCw />
             {TX.updateCustom[lang]}
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={onShare}>
-            <Share2 />
-            {TX.share[lang]}
-          </DropdownMenuItem>
-          <DropdownMenuItem variant="destructive" onSelect={() => void onFactoryReset()}>
+          <DropdownMenuItem variant="destructive" onSelect={onFactoryReset}>
             <Factory />
             {TX.factory[lang]}
           </DropdownMenuItem>
+          {isTauri() && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuCheckboxItem
+                checked={autostart}
+                onCheckedChange={(on) => void setAutostart(on)}
+              >
+                {TX.autostart[lang]}
+              </DropdownMenuCheckboxItem>
+            </>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
   );
-}
-
-/**
- * Bilingual lookup for an i18n key with a local fallback. The toolbar only needs
- * the "cleared" toast string; we try react-i18next's catalog first (so a real
- * translation wins) and fall back to a sensible default if the key is missing.
- */
-function t(key: string, lang: Lang): string {
-  const fallback: Record<string, { zh: string; en: string }> = {
-    "eq.toast.cleared": { zh: "已重置均衡器", en: "Equalizer cleared" },
-    "eq.toast.updateDone": { zh: "已更新自定义 EQ", en: "Custom EQ updated" },
-    "eq.toast.updateNoTarget": {
-      zh: "请先在「自定义」里选择一个要更新的 EQ",
-      en: "Select a custom EQ to update first",
-    },
-    "eq.toast.sharePending": { zh: "分享功能即将上线", en: "Sharing coming soon" },
-    "eq.toast.factoryReset": { zh: "已恢复出厂设置", en: "Factory settings restored" },
-    "eq.toast.factoryResetFailed": { zh: "恢复出厂失败", en: "Factory reset failed" },
-  };
-  return fallback[key]?.[lang] ?? key;
 }

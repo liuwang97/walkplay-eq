@@ -16,13 +16,15 @@ On ANY EQ change the app re-sends the FULL program: 8 band frames + 1 commit.
 
 ```
 Band frame (36 bytes):
-  01 09 18 00 <band:1> 00 00 | <20 bytes: 5×int32 LE coeffs> | <gain:2 LE> <flags> | <CRC16:2>
+  01 09 18 00 <band:1> 00 00 | <20 bytes: 5×int32 LE coeffs> | <freq:u16> <Q*256:u16> <gain*256:i16> <type:u8> <preamp dB:i8> <tag:u8>
     01      = device/channel prefix
     09      = opcode "write EQ band coefficients"
     18 (24) = payload length
     band    = 0..7  (this device has 8 bands)
   coeffs order = [b0, b1, b2, -a1, -a2], each = round(coef * (1<<30)) as int32 LE  (Q30)
-  trailing  = 2-byte gain word + flag bytes (…02 00 01 seen on defaults) + CRC16 (0x6dfd-style)
+  trailing  = bookkeeping the device stores and hands back on a read (80 09 00): the band's
+              freq / Q / gain / type, then the EQ's preamp and its preset tag. In the frames
+              below "fd 6d" is preamp -3 dB and tag 109 — not a checksum.
 
 Commit frame (7 bytes):
   01 0a 04 00 00 ff ff      // opcode 0x0a = "flush to register/RAM", applies the program

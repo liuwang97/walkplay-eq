@@ -1,180 +1,105 @@
 /**
- * Typed wrappers around Tauri `invoke` for the Rust command surface.
- *
- * This is the ONE place the WebView talks to the native HID/firmware layer.
- * Keep these thin — they just type the boundary. Command names + payload shapes
- * are the cross-agent contract with the Rust side (src-tauri/src/{hid,firmware}.rs).
+ * Typed wrappers around Tauri `invoke` / `listen` — the ONE place the WebView
+ * talks to the Rust backend (src-tauri/src/{lib,hid,tray}.rs).
  */
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ConnStatus, DeviceInfo, EqBand, EqState } from "./types";
+import type { Language } from "@/i18n";
+import type { ConnStatus, DeviceInfo } from "./types";
 
 /**
  * Whether we are running inside the Tauri WebView (vs. a plain browser, e.g.
- * `vite` dev or `vite preview`). When false, every native call no-ops/throws a
- * friendly error instead of blowing up on a missing `window.__TAURI_INTERNALS__`.
+ * `vite` dev). When false, callers skip native calls.
  */
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-/** Result of a firmware version check (mirrors Rust `FirmwareCheck`). */
-export interface FirmwareCheck {
-  current: string;
-  latest?: string;
-  updateAvailable: boolean;
-  url?: string;
+// ---------------------------------------------------------------------------
+// Device
+// ---------------------------------------------------------------------------
+
+/** Open + handshake a device (auto-picked). The backend replays the current EQ. */
+export function hidConnect(): Promise<DeviceInfo> {
+  return invoke<DeviceInfo>("hid_connect");
 }
 
-/** Outcome of a firmware upgrade (mirrors Rust `FirmwareUpgradeResult`). */
-export interface FirmwareUpgradeResult {
-  success: boolean;
-  message: string;
-}
-
-/** One firmware-upgrade progress tick (mirrors Rust `FwProgress`). */
-export interface FwProgress {
-  phase:
-    | "idle"
-    | "download"
-    | "enter-dfu"
-    | "erase"
-    | "write-chunks"
-    | "verify"
-    | "reboot"
-    | "done"
-    | "aborted"
-    | "failed";
-  message: string;
-  /** 0..=100 overall progress. */
-  percent: number;
-  /** `true` when no device writes were performed (download/validation only). */
-  dry_run: boolean;
-}
-
-/** Enumerate attached compatible devices. */
-export function hidListDevices(): Promise<DeviceInfo[]> {
-  return invoke<DeviceInfo[]>("hid_list_devices");
-}
-
-/** Open + handshake a device. Omit vid/pid to auto-pick the primary device. */
-export function hidConnect(vid?: number, pid?: number): Promise<DeviceInfo> {
-  return invoke<DeviceInfo>("hid_connect", { vid, pid });
-}
-
-/** Close the active connection. */
+/** Close the connection and stop the backend from auto-reconnecting. */
 export function hidDisconnect(): Promise<void> {
   return invoke<void>("hid_disconnect");
 }
 
-/** Read the full EQ (all bands + preamp) back from the device. */
-export function hidReadEq(): Promise<EqState> {
-  return invoke<EqState>("hid_read_eq");
+/** What a freshly created window needs to catch up (mirrors Rust `Snapshot`). */
+export interface Snapshot {
+  status: Exclude<ConnStatus, "connecting">;
+  device: DeviceInfo | null;
+  /** A preset picked from the tray that no window has shown yet. */
+  pendingPreset: string | null;
+  /** Whether the app launches at system startup. */
+  autostart: boolean;
 }
 
-/** Write a single band to the device. */
-export function hidWriteBand(band: EqBand): Promise<void> {
-  return invoke<void>("hid_write_band", { band });
+/** The backend's live state; it may have connected while no window existed. */
+export function snapshot(): Promise<Snapshot> {
+  return invoke<Snapshot>("snapshot");
 }
 
-/** Write the global preamp / pre-gain to the device. */
-export function hidWritePreamp(preamp: number): Promise<void> {
-  return invoke<void>("hid_write_preamp", { preamp });
-}
-
-/** Send a raw HID output report (report id + payload). Used by the T02 coeff protocol. */
-export function hidSendRaw(reportId: number, data: number[]): Promise<void> {
-  return invoke<void>("hid_send_raw", { reportId, data });
-}
-
-/**
- * Register the current full EQ program (the exact frames last pushed) with the
- * backend, so its background poller can replay them verbatim after a hot-plug
- * reconnect — keeping the device's sound while no window is open.
- */
-export function hidSetProgram(reportId: number, frames: number[][]): Promise<void> {
-  return invoke<void>("hid_set_program", { reportId, frames });
-}
-
-/** Current connection snapshot (mirrors Rust `ConnStatusInfo`). */
-export interface ConnStatusInfo {
-  status: ConnStatus;
-  device?: DeviceInfo;
+/** Turn launch-at-startup on or off; resolves to the state actually in effect. */
+export function setAutostart(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("set_autostart", { enabled });
 }
 
 /**
- * Read the live connection status + open device from the backend. Used by a
- * freshly (re)created window to seed its store — the backend may already be
- * connected (or have reconnected in the background) while no window existed.
+ * Apply a full EQ program in one round trip. The backend writes it if a device
+ * is connected and, either way, keeps it to replay on every (re)connect.
+ * `saveFrames` follow a second later and make the device keep the program
+ * across power loss; pass none for a program that is only being tried out.
+ * `presetId` names the preset the program equals, if any.
  */
-export function hidStatus(): Promise<ConnStatusInfo> {
-  return invoke<ConnStatusInfo>("hid_status");
-}
-
-/** Reset the device EQ to factory defaults. */
-export function hidFactoryReset(): Promise<void> {
-  return invoke<void>("hid_factory_reset");
-}
-
-/** Push a connection status to the native tray (tooltip/title). */
-export function setTrayStatus(status: ConnStatus): Promise<void> {
-  return invoke<void>("set_tray_status", { status });
-}
-
-/** Check whether a firmware update is available for the given device. */
-export function fwCheck(vid: number, pid: number): Promise<FirmwareCheck> {
-  return invoke<FirmwareCheck>("fw_check", { vid, pid });
+export function hidApplyProgram(
+  reportId: number,
+  frames: number[][],
+  saveFrames: number[][],
+  presetId: string | null,
+): Promise<void> {
+  return invoke<void>("hid_apply_program", { reportId, frames, saveFrames, presetId });
 }
 
 /**
- * Download + flash a firmware image.
- *
- * `confirmed` is the brick-safety gate on the Rust side: without it the flow
- * runs as a dry run (download + validate + progress, no device writes).
+ * Write frames once, without the backend remembering them — for commands that
+ * must not be replayed on reconnect. Rejects when no device is connected.
  */
-export function fwUpgrade(url: string, confirmed = false): Promise<FirmwareUpgradeResult> {
-  return invoke<FirmwareUpgradeResult>("fw_upgrade", { url, confirmed });
+export function hidSend(reportId: number, frames: number[][]): Promise<void> {
+  return invoke<void>("hid_send", { reportId, frames });
+}
+
+/** Ask the device a question and get its reply (without the report id). */
+export function hidQuery(reportId: number, frame: number[]): Promise<number[]> {
+  return invoke<number[]>("hid_query", { reportId, frame });
+}
+
+/** Subscribe to connection-status transitions (`conn-status` event). */
+export function onConnStatus(handler: () => void): Promise<UnlistenFn> {
+  return listen("conn-status", handler);
 }
 
 // ---------------------------------------------------------------------------
-// Tray <-> UI: quick EQ switch
+// Tray
 // ---------------------------------------------------------------------------
 
-/** A tray-facing preset entry: the id + label the native "Quick EQ" submenu shows. */
+/** A tray "Quick EQ" entry: its label plus the program that applies it. */
 export interface TrayPreset {
   id: string;
   name: string;
-  /** HID report id for {@link frames} (T02 = 75). Lets the tray apply this preset. */
-  reportId?: number;
-  /**
-   * The full precomputed program (band frames + commit + preamp) for this preset.
-   * The native tray uses these to apply the preset directly on the device when no
-   * window is open (the WebView, which normally builds them, has been destroyed).
-   */
-  frames?: number[][];
+  reportId: number;
+  frames: number[][];
+  saveFrames: number[][];
 }
 
-/**
- * Push the current preset list to the native tray so its "Quick EQ" submenu can
- * be (re)built. The tray emits `apply-preset` with the chosen id on click.
- */
-export function setTrayPresets(presets: TrayPreset[]): Promise<void> {
-  return invoke<void>("set_tray_presets", { presets });
-}
-
-// ---------------------------------------------------------------------------
-// Event subscriptions (Rust -> WebView)
-// ---------------------------------------------------------------------------
-
-/** Subscribe to native connection-status transitions (`conn-status` event). */
-export function onConnStatus(handler: (status: ConnStatus) => void): Promise<UnlistenFn> {
-  return listen<ConnStatus>("conn-status", (e) => handler(e.payload));
-}
-
-/** Subscribe to firmware-upgrade progress (`fw-progress` event). */
-export function onFwProgress(handler: (progress: FwProgress) => void): Promise<UnlistenFn> {
-  return listen<FwProgress>("fw-progress", (e) => handler(e.payload));
+/** Give the tray the UI language and the preset library it can switch between. */
+export function traySync(lang: Language, presets: TrayPreset[]): Promise<void> {
+  return invoke<void>("tray_sync", { lang, presets });
 }
 
 /** Subscribe to tray "Quick EQ" selections (`apply-preset` event, payload = preset id). */

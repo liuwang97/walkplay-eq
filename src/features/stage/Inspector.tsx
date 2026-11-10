@@ -13,15 +13,12 @@
  */
 
 import type { CSSProperties } from "react";
-import { useTranslation } from "react-i18next";
-
+import { useLang, type Language } from "@/i18n";
 import { useEqStore } from "@/lib/store";
 import { clamp, fmtFreq, palette, round05 } from "@/lib/theme";
-import type { EqBandType } from "@/lib/types";
+import { BAND_TYPES, type EqBandType } from "@/lib/types";
 
 const MONO = "'JetBrains Mono', monospace";
-
-type Lang = "zh" | "en";
 
 const TX = {
   band: { zh: "频段", en: "Band" },
@@ -31,9 +28,15 @@ const TX = {
   gain: { zh: "增益", en: "Gain" },
 } as const;
 
-const TYPE_NAMES: Record<Lang, Record<EqBandType, string>> = {
-  zh: { PK: "峰值 Peaking", LS: "低架 Low Shelf", HS: "高架 High Shelf" },
-  en: { PK: "Peaking", LS: "Low Shelf", HS: "High Shelf" },
+const TYPE_NAMES: Record<Language, Record<EqBandType, string>> = {
+  zh: {
+    PK: "峰值 Peaking",
+    LS: "低架 Low Shelf",
+    HS: "高架 High Shelf",
+    LP: "低通 Low Pass",
+    HP: "高通 High Pass",
+  },
+  en: { PK: "Peaking", LS: "Low Shelf", HS: "High Shelf", LP: "Low Pass", HP: "High Pass" },
 };
 
 const stepBtn: CSSProperties = {
@@ -70,8 +73,7 @@ const fieldLabel: CSSProperties = {
 };
 
 export default function Inspector() {
-  const { i18n } = useTranslation();
-  const lang: Lang = i18n.language?.startsWith("en") ? "en" : "zh";
+  const lang = useLang();
 
   const bands = useEqStore((s) => s.eq.bands);
   const selected = useEqStore((s) => s.selected);
@@ -191,7 +193,7 @@ export default function Inspector() {
             borderRadius: "9px",
           }}
         >
-          {(["PK", "LS", "HS"] as const).map((tp) => {
+          {BAND_TYPES.map((tp) => {
             const active = b.type === tp;
             const style: CSSProperties = active
               ? {

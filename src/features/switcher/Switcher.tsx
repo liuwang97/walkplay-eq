@@ -2,9 +2,9 @@
  * Switcher — the left-rail preset browser (porcelain redesign).
  *
  * Hand-styled (inline) to match the Claude Design handoff pixel-for-pixel
- * (see design-ref/project/WalkPlay EQ.dc.html, the <aside> sidebar). Preserves
- * the full preset feature set from the old PresetPanel/PresetRow:
- *   - 4 tabs: 预设 / 自定义 / 在线 / 我的分享 (builtin / custom / online / shares)
+ * (see design-ref/project/WalkPlay EQ.dc.html, the <aside> sidebar):
+ *   - tabs: 预设 / 自定义 (builtin / custom); 在线 / 我的分享 (online / shares)
+ *     exist but stay hidden behind CLOUD_TABS until the app has a sign-in
  *   - apply (applyPreset), audition toggle (auditionEngine), rename/delete
  *     for custom presets, like for cloud presets, and "save current as preset".
  *
@@ -18,7 +18,6 @@ import {
   useSyncExternalStore,
   type CSSProperties,
 } from "react";
-import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import {
@@ -30,7 +29,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { BUILTIN_FALLBACK_LABELS } from "@/features/presets/builtins";
+import { useLang, type Language } from "@/i18n";
+import { presetLabel } from "@/features/presets/builtins";
 import { auditionEngine } from "@/features/presets/audition";
 import {
   toggleShareLike,
@@ -41,17 +41,16 @@ import {
 } from "@/features/presets/cloud";
 import { useEqStore } from "@/lib/store";
 import { hexA, palette, thumbPath } from "@/lib/theme";
-import type { EqState, Preset } from "@/lib/types";
+import type { Preset } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
 // i18n strings (local, bilingual) — mirrors the design handoff's TX table.
 // ---------------------------------------------------------------------------
 
-type Lang = "zh" | "en";
-
 const TX = {
   zh: {
     deviceFallback: "WP‑T02 解码耳放",
+    firmware: "固件",
     switcher: "切换器",
     tabPreset: "预设",
     tabCustom: "自定义",
@@ -78,6 +77,7 @@ const TX = {
   },
   en: {
     deviceFallback: "WP‑T02 DAC/Amp",
+    firmware: "firmware",
     switcher: "Switcher",
     tabPreset: "Presets",
     tabCustom: "Custom",
@@ -105,6 +105,13 @@ const TX = {
 } as const;
 
 type TabKey = "preset" | "custom" | "online" | "shared";
+
+/**
+ * The 在线 / 我的分享 tabs read the vendor's cloud, which needs an account, and
+ * the app has no sign-in yet. While this is off they are not shown and nothing
+ * is fetched.
+ */
+const CLOUD_TABS: boolean = false;
 
 // ---------------------------------------------------------------------------
 // Small inline-styled primitives
@@ -221,7 +228,7 @@ interface PresetCardProps {
   active: boolean;
   accent: ReturnType<typeof palette>;
   auditioningId: string | null;
-  tx: (typeof TX)[Lang];
+  tx: (typeof TX)[Language];
   onApply: (p: Preset) => void;
   onRename?: (p: Preset) => void;
   onDelete?: (p: Preset) => void;
@@ -243,6 +250,7 @@ function PresetCard({
   const [hover, setHover] = useState(false);
   const cloud = isCloudPreset(preset) ? preset : null;
   const isAuditioning = auditioningId === preset.id;
+  const showControls = hover || isAuditioning;
 
   // Meta line: cloud -> "author ♥ likes"; local -> "+0 dB pre".
   let meta: string;
@@ -255,8 +263,7 @@ function PresetCard({
     meta = `${sign}${Math.abs(Math.round(p))} dB pre`;
   }
 
-  const eqState: EqState = { bands: preset.bands, preamp: preset.preamp };
-  const thumb = useMemo(() => thumbPath(eqState, 108, 34), [preset]);
+  const thumb = useMemo(() => thumbPath(preset, 108, 34), [preset]);
   const thumbColor = active ? accent.a : "rgba(28,32,58,0.32)";
 
   const cardStyle: CSSProperties = {
@@ -325,15 +332,13 @@ function PresetCard({
         </div>
       </div>
 
-      {/* per-card controls (appear on hover / when active / when auditioning) */}
+      {/* per-card controls: take the thumbnail's place on hover / while auditioning */}
       <div
         style={{
-          display: "flex",
+          display: showControls ? "flex" : "none",
           alignItems: "center",
           gap: 1,
           flexShrink: 0,
-          opacity: hover || isAuditioning || active ? 1 : 0,
-          transition: "opacity 0.14s",
         }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -368,7 +373,12 @@ function PresetCard({
       </div>
 
       {/* mini-curve thumbnail */}
-      <svg viewBox="0 0 108 34" width="64" height="22" style={{ flexShrink: 0, overflow: "visible" }}>
+      <svg
+        viewBox="0 0 108 34"
+        width="64"
+        height="22"
+        style={{ flexShrink: 0, overflow: "visible", display: showControls ? "none" : "block" }}
+      >
         <line x1="0" y1="17" x2="108" y2="17" stroke="rgba(28,32,58,0.10)" strokeWidth="1" />
         <path
           d={thumb}
@@ -427,20 +437,17 @@ function CenterNote({ children }: { children: React.ReactNode }) {
 
 function Spinner({ accent }: { accent: string }) {
   return (
-    <>
-      <style>{"@keyframes wpSpin{to{transform:rotate(360deg)}}"}</style>
-      <span
-        style={{
-          width: 18,
-          height: 18,
-          borderRadius: "50%",
-          border: `2px solid ${hexA(accent, 0.2)}`,
-          borderTopColor: accent,
-          animation: "wpSpin 0.7s linear infinite",
-          display: "inline-block",
-        }}
-      />
-    </>
+    <span
+      style={{
+        width: 18,
+        height: 18,
+        borderRadius: "50%",
+        border: `2px solid ${hexA(accent, 0.2)}`,
+        borderTopColor: accent,
+        animation: "wpSpin 0.7s linear infinite",
+        display: "inline-block",
+      }}
+    />
   );
 }
 
@@ -449,8 +456,7 @@ function Spinner({ accent }: { accent: string }) {
 // ---------------------------------------------------------------------------
 
 export default function Switcher() {
-  const { i18n } = useTranslation();
-  const lang: Lang = i18n.language?.startsWith("en") ? "en" : "zh";
+  const lang = useLang();
   const tx = TX[lang];
 
   const presets = useEqStore((s) => s.presets);
@@ -467,8 +473,9 @@ export default function Switcher() {
 
   const [tab, setTab] = useState<TabKey>("preset");
 
-  const online = useOnlinePresets();
-  const shares = useMyShares();
+  // Cloud lists are fetched only once their tab is opened.
+  const online = useOnlinePresets(CLOUD_TABS && tab === "online");
+  const shares = useMyShares(CLOUD_TABS && tab === "shared");
 
   const builtin = useMemo(() => presets.filter((p) => p.source === "preset"), [presets]);
   const custom = useMemo(() => presets.filter((p) => p.source === "custom"), [presets]);
@@ -477,13 +484,7 @@ export default function Switcher() {
   const [renameTarget, setRenameTarget] = useState<Preset | null>(null);
   const [renameValue, setRenameValue] = useState("");
 
-  // --- label resolution: builtins carry an i18n key with a zh fallback. ---
-  const labelOf = (p: Preset | CloudPreset): string => {
-    if (p.source === "preset") {
-      return i18n.t(p.name, { defaultValue: BUILTIN_FALLBACK_LABELS[p.name] ?? p.name });
-    }
-    return p.name;
-  };
+  const labelOf = (p: Preset | CloudPreset): string => presetLabel(p, lang);
 
   // --- handlers ---
   const handleApply = (p: Preset) => applyPreset(p);
@@ -526,14 +527,14 @@ export default function Switcher() {
           ? cloudResource.data.length
           : 0;
 
+  const firmware = useEqStore((s) => s.firmware);
   const deviceName = device?.name ?? tx.deviceFallback;
 
   // --- tab segmented control ---
   const tabs: [TabKey, string][] = [
     ["preset", tx.tabPreset],
     ["custom", tx.tabCustom],
-    ["online", tx.tabOnline],
-    ["shared", tx.tabShared],
+    ...(CLOUD_TABS ? ([["online", tx.tabOnline], ["shared", tx.tabShared]] as [TabKey, string][]) : []),
   ];
   const tabBase: CSSProperties = {
     flex: 1,
@@ -557,7 +558,6 @@ export default function Switcher() {
         flexDirection: "column",
         background: "linear-gradient(180deg, #fafbfd 0%, #f6f7fa 100%)",
         borderRight: "1px solid rgba(28,32,58,0.08)",
-        fontFamily: "'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif",
       }}
     >
       {/* Device card */}
@@ -621,7 +621,9 @@ export default function Switcher() {
               >
                 384k · 32bit
               </span>
-              <span style={{ fontSize: 11, color: MUTED }}>USB‑DAC</span>
+              <span style={{ fontSize: 11, color: MUTED }}>
+                {firmware ? `${tx.firmware} ${firmware}` : "USB‑DAC"}
+              </span>
             </div>
           </div>
         </div>

@@ -1,27 +1,13 @@
 /**
- * Cloud-backed preset hooks for the 在线 (online) and 我的分享 (my shares) tabs.
+ * Cloud-backed presets for the 在线 (online) and 我的分享 (my shares) tabs: a
+ * thin fetch layer over the vendor's API.
  *
- * The shared cloud-api layer (src/lib/api) is still a stub: it currently exports
- * only `API_BASE` / `WECHAT_APPID` / `api`, not data hooks. Per the cross-agent
- * contract these named hooks WILL appear there:
- *
- *     import { useOnlinePresets, useMyShares } from "@/lib/api";
- *
- * mapping onto the documented endpoints:
- *   - 在线   -> GET  /api/v3/eq/queryUserEQShareInfoList   (public share list)
+ *   - 在线     -> GET  /api/v3/eq/queryUserEQShareInfoList   (public share list)
  *   - 我的分享 -> GET  /api/v3/eq/queryUserEQShareInfoList?mine=1
- *   - 点赞   -> POST /api/v3/eq/{eqLike,eqCancelLike}
- *   - 收藏   -> POST /api/v3/eq/eqCollect
- *
- * Until the API agent ships those hooks we keep this self-contained: a thin
- * fetch layer against the same endpoints, wrapped in @tanstack/react-query.
- * When the real hooks land, swap the bodies of {@link useOnlinePresets} /
- * {@link useMyShares} for `return apiUseOnlinePresets()` — the return shape is
- * identical, so PresetPanel does not change.
+ *   - 点赞     -> POST /api/v3/eq/{eqLike,eqCancelLike}
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { API_BASE } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
 import {
   DEFAULT_BANDS,
   type EqBand,
@@ -29,6 +15,9 @@ import {
   type Preset,
   type PresetSource,
 } from "@/lib/types";
+
+/** Cloud API host, the same one the official app talks to. */
+const API_BASE = "https://www.szwalkplay.com";
 
 /**
  * Raw share record as returned by /api/v3/eq/queryUserEQShareInfoList.
@@ -165,23 +154,21 @@ async function fetchShareList(mine: boolean, signal: AbortSignal): Promise<EqSha
   return extractList(await res.json());
 }
 
-/** Shared loader powering both cloud tabs. */
-function useShareResource(mine: boolean): CloudResource<CloudPreset[]> {
+/**
+ * Shared loader powering both cloud tabs. Nothing is fetched until `enabled`
+ * first turns true (the tab is opened); after that the list is kept.
+ */
+function useShareResource(mine: boolean, enabled: boolean): CloudResource<CloudPreset[]> {
   const source: PresetSource = mine ? "shared" : "online";
   const [data, setData] = useState<CloudPreset[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
-  const aliveRef = useRef(true);
+  const [started, setStarted] = useState(enabled);
+  if (enabled && !started) setStarted(true);
 
   useEffect(() => {
-    aliveRef.current = true;
-    return () => {
-      aliveRef.current = false;
-    };
-  }, []);
-
-  useEffect(() => {
+    if (!started) return;
     const ctrl = new AbortController();
     setLoading(true);
     setError(null);
@@ -199,20 +186,20 @@ function useShareResource(mine: boolean): CloudResource<CloudPreset[]> {
         if (!ctrl.signal.aborted) setLoading(false);
       });
     return () => ctrl.abort();
-  }, [mine, source, nonce]);
+  }, [mine, source, nonce, started]);
 
   const refetch = useCallback(() => setNonce((n) => n + 1), []);
   return { data, loading, error, refetch };
 }
 
 /** 在线 tab: public shared EQ presets. */
-export function useOnlinePresets(): CloudResource<CloudPreset[]> {
-  return useShareResource(false);
+export function useOnlinePresets(enabled: boolean): CloudResource<CloudPreset[]> {
+  return useShareResource(false, enabled);
 }
 
 /** 我的分享 tab: the current user's own shared EQ presets. */
-export function useMyShares(): CloudResource<CloudPreset[]> {
-  return useShareResource(true);
+export function useMyShares(enabled: boolean): CloudResource<CloudPreset[]> {
+  return useShareResource(true, enabled);
 }
 
 /**

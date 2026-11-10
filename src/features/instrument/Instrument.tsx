@@ -24,7 +24,10 @@ import {
   freqToX,
   xToFreq,
   dbToY,
+  yToDb,
   fmtFreq,
+  FREQ_TICKS,
+  DB_TICKS,
   clamp,
   round1,
   round05,
@@ -34,16 +37,13 @@ import type { EqState, EqBand } from "@/lib/types";
 
 const W = INSTR_W;
 const H = INSTR_H;
+/** Frequencies the response curve is sampled at (fixed, so built once). */
+const CURVE_AXIS = makeFreqAxis(220);
 
 /** Local-only displayed EQ values that ease toward the store. */
 interface ViewState {
   gains: number[];
   preamp: number;
-}
-
-/** y -> dB inverse using the same span as theme.dbToY. */
-function yToDbLocal(y: number): number {
-  return ((H / 2 - y) / (H / 2 - 22)) * 15;
 }
 
 type DragKind = "node" | "gain" | "preamp";
@@ -147,7 +147,7 @@ export default function Instrument() {
       if (d.type === "node") {
         const x = ((e.clientX - r.left) / r.width) * W;
         const y = ((e.clientY - r.top) / r.height) * H;
-        const gain = clamp(round1(yToDbLocal(y)), -10, 10);
+        const gain = clamp(round1(yToDb(y)), -10, 10);
         const freq = clamp(Math.round(xToFreq(clamp(x, 0, W))), 20, 20000);
         setBand(d.id, { gain, freq });
       } else if (d.type === "gain") {
@@ -155,7 +155,7 @@ export default function Instrument() {
         setBand(d.id, { gain: clamp(round05(10 - ratio * 20), -10, 10) });
       } else if (d.type === "preamp") {
         const ratio = clamp((e.clientY - r.top) / r.height, 0, 1);
-        setPreamp(clamp(round05(6 - ratio * 22), -16, 6));
+        setPreamp(6 - ratio * 22);
       }
     };
     const onUp = () => {
@@ -196,7 +196,7 @@ export default function Instrument() {
     dragRef.current = { type: "preamp", id: -1, rect: r };
     setDragging(true);
     const ratio = clamp((e.clientY - r.top) / r.height, 0, 1);
-    setPreamp(clamp(round05(6 - ratio * 22), -16, 6));
+    setPreamp(6 - ratio * 22);
   };
 
   // --- displayed bands (real freq/type/enabled, view gains) -----------------
@@ -208,7 +208,7 @@ export default function Instrument() {
   const viewPreamp = view.preamp;
 
   // --- live curve via DSP ---------------------------------------------------
-  const freqAxis = makeFreqAxis(220);
+  const freqAxis = CURVE_AXIS;
   const tempEq: EqState = { bands: viewBands, preamp: viewPreamp };
   const mags = computeMagnitudeResponse(tempEq, freqAxis);
 
@@ -226,7 +226,7 @@ export default function Instrument() {
 
   // --- grid -----------------------------------------------------------------
   const gridEls: React.ReactNode[] = [];
-  [-12, -6, 0, 6, 12].forEach((db) => {
+  DB_TICKS.forEach((db) => {
     const y = dbToY(db);
     gridEls.push(
       <line
@@ -253,7 +253,7 @@ export default function Instrument() {
       </text>,
     );
   });
-  [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000].forEach((f) => {
+  FREQ_TICKS.forEach((f) => {
     const x = freqToX(f);
     gridEls.push(
       <line
