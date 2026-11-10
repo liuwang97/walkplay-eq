@@ -12,7 +12,10 @@ import i18n, { getLanguage } from "@/i18n";
 import {
   buildFactoryReset,
   buildProgram,
+  micGainFrame,
+  parseMicGain,
   parseVersion,
+  READ_MIC_GAIN,
   READ_VERSION,
   SAVE_TO_FLASH,
   T02_REPORT_ID,
@@ -25,6 +28,7 @@ import {
   cloneEq,
   DEFAULT_BANDS,
   fitBands,
+  MIC_GAIN,
   snapPreamp,
   type ConnStatus,
   type DeviceInfo,
@@ -106,6 +110,8 @@ export interface EqStoreState {
   device: DeviceInfo | null;
   /** The connected device's firmware version, once it has answered. */
   firmware: string | null;
+  /** The connected device's microphone gain in dB, once it has answered. */
+  micGain: number | null;
   status: ConnStatus;
   eq: EqState;
   presets: Preset[];
@@ -140,6 +146,8 @@ export interface EqStoreState {
   setBand: (id: number, patch: Partial<EqBand>) => void;
   /** Set the global preamp (dB) and apply it. */
   setPreamp: (preamp: number) => void;
+  /** Set the device's microphone gain (dB); the device keeps it. */
+  setMicGain: (db: number) => void;
   /** Replace the live EQ with a preset's bands/preamp and apply it. */
   applyPreset: (preset: Preset) => void;
   /** Restore the default EQ (all bands, types and frequencies) and re-enable it. */
@@ -184,6 +192,8 @@ type Get = () => EqStoreState;
 let syncTimer: ReturnType<typeof setTimeout> | undefined;
 let syncing = false;
 let syncAgain = false;
+
+let micSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** The next send should also make the device keep the EQ across power loss. */
 let saveNext = false;
@@ -265,18 +275,20 @@ export const useEqStore = create<EqStoreState>((set, get) => {
     syncTray(presets);
   };
 
-  /** Ask the connected device for its firmware version. */
-  const readFirmware = async () => {
-    const reply = await bridge.hidQuery(T02_REPORT_ID, READ_VERSION).catch(() => null);
-    set({ firmware: reply && parseVersion(reply) });
+  /** Ask the connected device for its firmware version and microphone gain. */
+  const readDevice = async () => {
+    const ask = (query: number[]) => bridge.hidQuery(T02_REPORT_ID, query).catch(() => null);
+    const version = await ask(READ_VERSION);
+    const mic = await ask(READ_MIC_GAIN);
+    set({ firmware: version && parseVersion(version), micGain: mic && parseMicGain(mic) });
   };
 
   /** Pull connection status, device and settings from the backend. */
   const refreshConnection = async () => {
     const snap = await bridge.snapshot();
     set({ status: snap.status, device: snap.device, autostart: snap.autostart });
-    if (snap.status === "connected") void readFirmware();
-    else set({ firmware: null });
+    if (snap.status === "connected") void readDevice();
+    else set({ firmware: null, micGain: null });
     return snap;
   };
 
@@ -307,6 +319,7 @@ export const useEqStore = create<EqStoreState>((set, get) => {
   return {
     device: null,
     firmware: null,
+    micGain: null,
     status: "disconnected",
     eq: cloneEq(WORKING.eq ?? { bands: DEFAULT_BANDS, preamp: 0 }),
     presets: [...BUILTIN_PRESETS.map((p) => ({ ...p, ...cloneEq(p) })), ...loadCustomPresets()],
@@ -375,8 +388,25 @@ export const useEqStore = create<EqStoreState>((set, get) => {
       // that follows only plays. With no device to reset, have the flat EQ
       // saved on the next connect instead.
       void bridge.hidSend(T02_REPORT_ID, buildFactoryReset()).then(
-        () => scheduleSync(get),
+        () => {
+          scheduleSync(get);
+          // The device needs a moment before it reports its new state.
+          setTimeout(() => void readDevice(), 500);
+        },
         () => scheduleSync(get, true),
+      );
+    },
+
+    setMicGain: (db) => {
+      const micGain = Math.max(MIC_GAIN.min, Math.min(MIC_GAIN.max, Math.round(db)));
+      set({ micGain });
+      if (!bridge.isTauri()) return;
+      void bridge.hidSend(T02_REPORT_ID, [micGainFrame(micGain)]).catch(() => {});
+      // Have the device keep it once the stepping has settled.
+      clearTimeout(micSaveTimer);
+      micSaveTimer = setTimeout(
+        () => void bridge.hidSend(T02_REPORT_ID, [SAVE_TO_FLASH]).catch(() => {}),
+        1000,
       );
     },
 
@@ -457,7 +487,7 @@ export const useEqStore = create<EqStoreState>((set, get) => {
         // The backend replays the current program on the freshly opened device.
         const device = await bridge.hidConnect();
         set({ device, status: "connected" });
-        void readFirmware();
+        void readDevice();
       } catch (err) {
         set({ status: "disconnected", device: null });
         throw err;
@@ -466,7 +496,7 @@ export const useEqStore = create<EqStoreState>((set, get) => {
 
     disconnect: async () => {
       await bridge.hidDisconnect();
-      set({ device: null, firmware: null, status: "disconnected" });
+      set({ device: null, firmware: null, micGain: null, status: "disconnected" });
     },
   };
 });

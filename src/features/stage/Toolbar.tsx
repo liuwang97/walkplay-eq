@@ -8,7 +8,8 @@
  *   [ title + bands badge ] [ master toggle ] [ flex spacer ]
  *   [ live FREQ|GAIN readout ] [ A/B segmented + copy ] [ reset ] [ more ]
  *
- * The overflow menu holds: update custom EQ, restore default EQ, launch at startup.
+ * The overflow menu holds: update custom EQ, factory reset, microphone gain,
+ * launch at startup.
  *
  * Takes no props — everything is read from the global EQ store.
  */
@@ -29,9 +30,19 @@ import { useLang } from "@/i18n";
 import { isTauri } from "@/lib/bridge";
 import { useEqStore } from "@/lib/store";
 import { fmtFreq, hexA, palette } from "@/lib/theme";
-import type { Preset } from "@/lib/types";
+import { MIC_GAIN, type Preset } from "@/lib/types";
 
 const MONO = "'JetBrains Mono', monospace";
+
+const micStep: CSSProperties = {
+  width: "22px",
+  height: "22px",
+  borderRadius: "6px",
+  border: "1px solid rgba(28,32,58,0.12)",
+  background: "#fff",
+  cursor: "pointer",
+  lineHeight: 1,
+};
 
 const TX = {
   equalizer: { zh: "均衡器", en: "Equalizer" },
@@ -44,7 +55,8 @@ const TX = {
   copy: { zh: "复制到另一槽", en: "Copy to other slot" },
   more: { zh: "更多操作", en: "More actions" },
   updateCustom: { zh: "更新自定义 EQ", en: "Update custom EQ" },
-  factory: { zh: "恢复默认 EQ", en: "Restore default EQ" },
+  factory: { zh: "恢复出厂设置", en: "Factory reset" },
+  micGain: { zh: "麦克风增益", en: "Mic gain" },
   autostart: { zh: "开机自启动", en: "Launch at startup" },
   cleared: { zh: "已重置均衡器", en: "Equalizer cleared" },
   updateDone: { zh: "已更新自定义 EQ", en: "Custom EQ updated" },
@@ -52,7 +64,7 @@ const TX = {
     zh: "请先在「自定义」里选择一个要更新的 EQ",
     en: "Select a custom EQ to update first",
   },
-  factoryDone: { zh: "已恢复默认 EQ", en: "Default EQ restored" },
+  factoryDone: { zh: "已恢复出厂设置", en: "Factory settings restored" },
 } as const;
 
 export default function Toolbar() {
@@ -71,6 +83,8 @@ export default function Toolbar() {
   const updateCustom = useEqStore((s) => s.updateCustom);
   const resetToDefault = useEqStore((s) => s.resetToDefault);
   const autostart = useEqStore((s) => s.autostart);
+  const micGain = useEqStore((s) => s.micGain);
+  const setMicGain = useEqStore((s) => s.setMicGain);
   const setAutostart = useEqStore((s) => s.setAutostart);
 
   const C = palette(accent);
@@ -321,6 +335,44 @@ export default function Toolbar() {
             <Factory />
             {TX.factory[lang]}
           </DropdownMenuItem>
+          {micGain !== null && (
+            <>
+              <DropdownMenuSeparator />
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "14px",
+                  padding: "6px 8px",
+                  fontSize: "13px",
+                }}
+              >
+                <span>{TX.micGain[lang]}</span>
+                <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  <button
+                    type="button"
+                    style={micStep}
+                    disabled={micGain <= MIC_GAIN.min}
+                    onClick={() => setMicGain(micGain - 1)}
+                  >
+                    −
+                  </button>
+                  <span style={{ minWidth: "48px", textAlign: "center", fontFamily: MONO }}>
+                    {(micGain > 0 ? "+" : "") + micGain} dB
+                  </span>
+                  <button
+                    type="button"
+                    style={micStep}
+                    disabled={micGain >= MIC_GAIN.max}
+                    onClick={() => setMicGain(micGain + 1)}
+                  >
+                    +
+                  </button>
+                </span>
+              </div>
+            </>
+          )}
           {isTauri() && (
             <>
               <DropdownMenuSeparator />

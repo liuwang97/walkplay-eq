@@ -699,8 +699,9 @@
     ]
   },
   "capturedReplies": {
-    "provenance": "Read from a real T02 on 2026-11-11 with the query the official app sends on connect (80 0c); the zero padding after the text is cut off.",
-    "version": { "reply": "800c00302e31", "text": "0.1" }
+    "provenance": "Read from a real T02 on 2026-11-11 with the queries the official app sends on connect (80 0c, 80 02 00); the zero padding at the end is cut off.",
+    "version": { "reply": "800c00302e31", "text": "0.1" },
+    "micGain": { "reply": "8002020000", "db": 0 }
   },
   "capturedPreampFrames": {
     "provenance": "Same capture session: the frame sent for each preamp value while dragging the official app's gain control.",

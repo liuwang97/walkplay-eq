@@ -118,6 +118,22 @@ export function buildFactoryReset(): number[][] {
   ];
 }
 
+/** Asks for the microphone gain. */
+export const READ_MIC_GAIN: number[] = [0x80, 0x02, 0x00];
+
+/** The microphone gain in dB in a reply to {@link READ_MIC_GAIN}. */
+export function parseMicGain(reply: number[]): number | null {
+  return reply[1] === READ_MIC_GAIN[1] ? (reply[4] << 24) >> 24 : null;
+}
+
+/**
+ * Sets the microphone gain in whole dB. It takes effect at once;
+ * {@link SAVE_TO_FLASH} makes the device keep it.
+ */
+export function micGainFrame(db: number): number[] {
+  return [0x01, 0x02, 0x02, 0x80, Math.round(db) & 0xff];
+}
+
 /** Asks for the firmware version. */
 export const READ_VERSION: number[] = [0x80, 0x0c];
 

@@ -3,9 +3,10 @@
  * device itself is the oracle, so these are skipped unless WALKPLAY_HIL is set:
  *
  *   read    only asks the device questions — nothing audible changes
- *   write   also writes a program and reads it back. Afterwards the device gets
- *           the program the app last applied (from the app's state file), or is
- *           left flat at -1 dB if the app has never run
+ *   write   also writes a program and a microphone gain and reads them back.
+ *           Afterwards the device gets the program the app last applied (from
+ *           the app's state file; flat at -1 dB if the app has never run) and
+ *           its previous microphone gain
  *   save    writes a marker EQ and tells the device to keep it. Then unplug the
  *           device, plug it back in, and run:
  *   saved   checks the marker EQ survived the power cycle. Open the app and
@@ -22,7 +23,10 @@ import HID from "node-hid";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   buildProgram,
+  micGainFrame,
+  parseMicGain,
   parseVersion,
+  READ_MIC_GAIN,
   READ_VERSION,
   SAVE_TO_FLASH,
   T02_REPORT_ID,
@@ -125,6 +129,20 @@ describe.skipIf(!MODE)("a real T02", () => {
     send(program);
     await pause(200);
     expect(held()).toEqual(expected);
+  });
+
+  it.skipIf(MODE !== "write")("takes a microphone gain and hands it back, sign included", async () => {
+    const before = parseMicGain(ask(READ_MIC_GAIN))!;
+    try {
+      for (const db of [before === 4 ? 5 : 4, -6]) {
+        send([micGainFrame(db)]);
+        await pause(200);
+        expect(parseMicGain(ask(READ_MIC_GAIN))).toBe(db);
+      }
+    } finally {
+      send([micGainFrame(before)]);
+      await pause(200);
+    }
   });
 
   it.skipIf(MODE !== "save")("is told to keep a marker EQ (now unplug it, plug it back in, run `saved`)", async () => {

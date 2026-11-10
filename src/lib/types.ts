@@ -96,6 +96,9 @@ export const EQ_LIMITS = {
   preamp: { min: -16, max: 6, step: 1 },
 } as const;
 
+/** The microphone gain range the official app offers for this device, in dB. */
+export const MIC_GAIN = { min: -15, max: 15 } as const;
+
 /** The nearest preamp the device can hold: whole dB within range. */
 export function snapPreamp(db: number): number {
   const { min, max, step } = EQ_LIMITS.preamp;

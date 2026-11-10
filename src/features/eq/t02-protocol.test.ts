@@ -26,6 +26,7 @@ import {
   buildBandFrame,
   buildFactoryReset,
   buildProgram,
+  parseMicGain,
   parseVersion,
   T02_SAMPLE_RATE,
 } from "./t02-protocol";
@@ -121,9 +122,10 @@ describe("against the official web app", () => {
 });
 
 describe("against a real T02", () => {
-  it("reads the firmware version out of the device's reply", () => {
-    const { reply, text } = ref.capturedReplies.version;
-    expect(parseVersion(unhex(reply))).toBe(text);
+  it("reads the firmware version and microphone gain out of the device's replies", () => {
+    const { version, micGain } = ref.capturedReplies;
+    expect(parseVersion(unhex(version.reply))).toBe(version.text);
+    expect(parseMicGain(unhex(micGain.reply))).toBe(micGain.db);
   });
 });
 
